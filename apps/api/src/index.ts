@@ -1,8 +1,10 @@
+import { CartAddItemRequestSchema, CartSetItemRequestSchema } from "@pricecart/shared";
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./env";
 import { cors } from "./middleware/cors";
 import { securityHeaders } from "./middleware/security";
+import { addCartItem, clearCart, getCart, removeCartItem, setCartItemQuantity } from "./services/cart";
 import { productSearch } from "./services/productSearch";
 import { storeSearch } from "./services/storeDiscovery";
 
@@ -15,6 +17,16 @@ app.use("*", securityHeaders());
 app.use("*", cors(ALLOWED_ORIGIN));
 
 app.get("/health", (c) => c.json({ ok: true }));
+const SessionIdSchema = z.string().min(1).max(128);
+
+function requireSession(c: any): string {
+  const raw = c.req.header("x-pricecart-session");
+  const parsed = SessionIdSchema.safeParse(raw);
+  if (!parsed.success) throw new Error("MISSING_SESSION");
+  return parsed.data;
+}
+
+
 
 const StoreSearchQuery = z.object({
   location: z.string().min(2).max(200),
@@ -153,6 +165,86 @@ app.get("/products/search", async (c) => {
       })
     );
 
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+app.get("/cart", async (c) => {
+  try {
+    const session_id = requireSession(c);
+    const cart = await getCart(c.env, session_id);
+    return c.json(cart);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return c.json(
+      { error: msg === "MISSING_SESSION" ? "MISSING_SESSION" : "INTERNAL_ERROR" },
+      msg === "MISSING_SESSION" ? 401 : 500
+    );
+  }
+});
+
+app.post("/cart/items", async (c) => {
+  try {
+    const session_id = requireSession(c);
+    const body = await c.req.json();
+    const parsed = CartAddItemRequestSchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: "INVALID_INPUT" }, 400);
+
+    const cart = await addCartItem(c.env, { session_id, ...parsed.data });
+    return c.json(cart);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
+    if (msg === "PRODUCT_NOT_FOUND") return c.json({ error: "PRODUCT_NOT_FOUND" }, 404);
+    if (msg === "CART_TOO_LARGE") return c.json({ error: "CART_TOO_LARGE" }, 413);
+    if (msg === "QUANTITY_TOO_LARGE") return c.json({ error: "QUANTITY_TOO_LARGE" }, 400);
+    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+app.patch("/cart/items/:upc", async (c) => {
+  try {
+    const session_id = requireSession(c);
+    const upc = c.req.param("upc");
+    const body = await c.req.json();
+    const parsed = CartSetItemRequestSchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: "INVALID_INPUT" }, 400);
+
+    const cart = await setCartItemQuantity(c.env, { session_id, upc, quantity: parsed.data.quantity });
+    return c.json(cart);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
+    if (msg === "QUANTITY_TOO_LARGE") return c.json({ error: "QUANTITY_TOO_LARGE" }, 400);
+    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+app.delete("/cart/items/:upc", async (c) => {
+  try {
+    const session_id = requireSession(c);
+    const upc = c.req.param("upc");
+    const cart = await removeCartItem(c.env, { session_id, upc });
+    return c.json(cart);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
+    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+app.post("/cart/clear", async (c) => {
+  try {
+    const session_id = requireSession(c);
+    const cart = await clearCart(c.env, session_id);
+    return c.json(cart);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
+    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
     return c.json({ error: "INTERNAL_ERROR" }, 500);
   }
 });

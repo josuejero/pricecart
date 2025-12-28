@@ -85,16 +85,13 @@ apps/
       vite-env.d.ts
     worker/
       index.ts
-    .gitignore
     eslint.config.js
     index.html
-    package.json
     README.md
     tsconfig.app.json
     tsconfig.client.json
     tsconfig.json
     tsconfig.node.json
-    tsconfig.tsbuildinfo
     tsconfig.worker.json
     vite.config.ts
     wrangler.jsonc
@@ -108,7 +105,6 @@ apps/
       App.tsx
       index.css
       main.tsx
-    .env
     .env.example
     .gitignore
     eslint.config.js
@@ -1879,40 +1875,6 @@ export default {
 };
 </file>
 
-<file path="apps/api/.gitignore">
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
-
-node_modules
-dist
-dist-ssr
-*.local
-
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
-.DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
-
-# wrangler files
-.wrangler
-.dev.vars*
-!.dev.vars.example
-.env*
-!.env.example
-</file>
-
 <file path="apps/api/eslint.config.js">
 import js from '@eslint/js'
 import globals from 'globals'
@@ -1953,51 +1915,6 @@ export default tseslint.config([
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-</file>
-
-<file path="apps/api/package.json">
-{
-	"name": "api",
-	"private": true,
-	"version": "0.0.0",
-	"type": "module",
-	"scripts": {
-		"typegen": "wrangler types",
-		"dev": "vite",
-		"build": "npm run -w @pricecart/shared build && npm run typegen && tsc -b && vite build",
-		"lint": "eslint .",
-		"preview": "npm run build && vite preview",
-		"deploy": "npm run build && wrangler deploy",
-		"cf-typegen": "wrangler types",
-		"test": "vitest run",
-		"test:watch": "vitest"
-	},
-	"dependencies": {
-		"@cloudflare/vite-plugin": "1.19.0",
-		"@pricecart/shared": "0.0.1",
-		"hono": "4.11.3",
-		"react": "^19.1.1",
-		"react-dom": "^19.1.1",
-		"zod": "4.2.1"
-	},
-	"devDependencies": {
-		"@eslint/js": "^9.33.0",
-		"@types/node": "25.0.3",
-		"@types/react": "^19.1.10",
-		"@types/react-dom": "^19.1.7",
-		"@vitejs/plugin-react": "^5.0.0",
-		"eslint": "^9.33.0",
-		"eslint-plugin-react-hooks": "^5.2.0",
-		"eslint-plugin-react-refresh": "^0.4.20",
-		"globals": "^16.3.0",
-		"miniflare": "4.20251217.0",
-		"typescript": "~5.8.3",
-		"typescript-eslint": "^8.39.1",
-		"vite": "^7.1.2",
-		"vitest": "4.0.16",
-		"wrangler": "4.54.0"
-	}
-}
 </file>
 
 <file path="apps/api/README.md">
@@ -2169,10 +2086,6 @@ export default tseslint.config([
   },
   "include": ["vite.config.ts"]
 }
-</file>
-
-<file path="apps/api/tsconfig.tsbuildinfo">
-{"root":["./src/env.ts","./src/index.ts","./src/vite-env.d.ts","./src/lib/cache.ts","./src/lib/circuitbreaker.ts","./src/lib/geo.ts","./src/lib/hash.ts","./src/lib/ratelimit.test.ts","./src/lib/ratelimit.ts","./src/lib/time.ts","./src/middleware/cors.ts","./src/middleware/security.ts","./src/providers/nominatim.ts","./src/providers/overpass.ts","./src/services/storediscovery.ts","./src/types/cloudflare-runtime.d.ts","./src/types/pricecart-shared.d.ts","./src/app.tsx","./src/main.tsx","./worker-configuration.d.ts"],"errors":true,"version":"5.8.3"}
 </file>
 
 <file path="apps/api/tsconfig.worker.json">
@@ -2761,10 +2674,6 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
 );
 </file>
 
-<file path="apps/web/.env">
-VITE_API_BASE_URL=http://localhost:8787
-</file>
-
 <file path="apps/web/.env.example">
 VITE_API_BASE_URL=http://localhost:8787
 </file>
@@ -3238,7 +3147,39 @@ export type StoreSearchResponse = z.infer<typeof StoreSearchResponseSchema>;
 </file>
 
 <file path=".gitignore">
+# Dependencies
+**/node_modules/
 
+# Build output
+**/dist/
+**/dist-ssr/
+packages/shared/dist/
+
+# TypeScript build artifacts
+**/*.tsbuildinfo
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Env files (keep examples)
+.env
+.env.*
+!.env.example
+
+# Cloudflare Wrangler
+**/.wrangler/
+.dev.vars
+.dev.vars.*
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+apps/web/.env
 </file>
 
 <file path=".repomixignore">

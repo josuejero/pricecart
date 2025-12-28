@@ -21,4 +21,13 @@ INSERT OR REPLACE INTO products (
   NULL, NULL,
   strftime('%s','now'),
   NULL
+),
+(
+  '012345678905', 'seed', NULL,
+  'Seed Honeycrisp Apples', 'Seed Brand',
+  3.0, 'lb',
+  'seed brand seed honeycrisp apples',
+  NULL, NULL,
+  strftime('%s','now'),
+  NULL
 );

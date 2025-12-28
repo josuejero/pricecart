@@ -7,7 +7,7 @@ export function cors(allowedOrigin: string): MiddlewareHandler {
       c.header("Access-Control-Allow-Origin", origin);
       c.header("Vary", "Origin");
       c.header("Access-Control-Allow-Headers", "content-type, x-pricecart-session");
-      c.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+      c.header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
     }
 
     if (c.req.method === "OPTIONS") {
