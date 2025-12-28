@@ -50,6 +50,7 @@ apps/
       0005_phase3_cart.sql
       0006_phase4_pricing.sql
       0007_phase4_seed_prices.sql
+      0008_phase5_kroger_live_prices.sql
     src/
       lib/
         cache.ts
@@ -64,16 +65,21 @@ apps/
         security.ts
       providers/
         __fixtures__/
+          kroger_locations_found.json
+          kroger_product_details_found.json
           off_lookup_found.json
           off_lookup_not_found.json
           off_schema_drift.json
           off_search_found.json
+        kroger.contract.test.ts
+        kroger.ts
         nominatim.ts
         openFoodFacts.contract.test.ts
         openFoodFacts.ts
         overpass.ts
       services/
         cart.ts
+        krogerLivePrices.ts
         pricing.test.ts
         pricing.ts
         productCatalog.ts
@@ -352,6 +358,27 @@ INSERT OR REPLACE INTO price_snapshots (
 );
 </file>
 
+<file path="apps/api/migrations/0008_phase5_kroger_live_prices.sql">
+-- Phase 5: Kroger live-price support (store -> provider location mapping)
+
+CREATE TABLE IF NOT EXISTS store_provider_mappings (
+  store_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  provider_location_id TEXT NOT NULL,
+  match_method TEXT NOT NULL,
+  match_score REAL NOT NULL,
+  created_at INTEGER NOT NULL,
+  verified_at INTEGER NOT NULL,
+  PRIMARY KEY (store_id, provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_provider_mappings_provider_location
+  ON store_provider_mappings(provider, provider_location_id);
+
+CREATE INDEX IF NOT EXISTS idx_store_provider_mappings_verified
+  ON store_provider_mappings(provider, verified_at);
+</file>
+
 <file path="apps/api/src/lib/cache.ts">
 import { nowSec } from "./time";
 
@@ -587,6 +614,30 @@ export function securityHeaders(): MiddlewareHandler {
 }
 </file>
 
+<file path="apps/api/src/providers/__fixtures__/kroger_locations_found.json">
+{
+  "data": [
+    {
+      "locationId": "12345",
+      "name": "Kroger - Demo Location",
+      "chain": "Kroger",
+      "geolocation": { "latitude": 40.75, "longitude": -73.99 }
+    }
+  ]
+}
+</file>
+
+<file path="apps/api/src/providers/__fixtures__/kroger_product_details_found.json">
+{
+  "data": {
+    "upc": "0001111041707",
+    "items": [
+      { "price": { "regular": 2.99, "promo": 1.99 } }
+    ]
+  }
+}
+</file>
+
 <file path="apps/api/src/providers/__fixtures__/off_lookup_found.json">
 {
   "status": 1,
@@ -640,6 +691,328 @@ export function securityHeaders(): MiddlewareHandler {
       "url": "https://world.openfoodfacts.org/product/0000000000001"
     }
   ]
+}
+</file>
+
+<file path="apps/api/src/providers/kroger.contract.test.ts">
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+import { parseKrogerLocationsResponse, parseKrogerProductDetailsResponse } from "./kroger";
+
+function fixture(name: string) {
+  return JSON.parse(readFileSync(new URL(`./__fixtures__/${name}`, import.meta.url), "utf-8"));
+}
+
+describe("Kroger provider (contract)", () => {
+  it("parses locations", () => {
+    const json = fixture("kroger_locations_found.json");
+    const locs = parseKrogerLocationsResponse(json);
+    expect(locs.length).toBeGreaterThan(0);
+    expect(locs[0].locationId).toBe("12345");
+    expect(typeof locs[0].lat).toBe("number");
+    expect(typeof locs[0].lon).toBe("number");
+  });
+
+  it("parses product price (prefers promo)", () => {
+    const json = fixture("kroger_product_details_found.json");
+    const p = parseKrogerProductDetailsResponse(json, "0001111041707");
+    expect(p.upc).toBe("0001111041707");
+    expect(p.price_cents).toBe(199);
+  });
+});
+</file>
+
+<file path="apps/api/src/providers/kroger.ts">
+import { z } from "zod";
+import { isOpen, recordFailure, recordSuccess } from "../lib/circuitBreaker";
+
+const PROVIDER = "kroger";
+
+function b64(s: string) {
+  const g: any = globalThis as any;
+  if (typeof g.btoa === "function") return g.btoa(s);
+  return Buffer.from(s, "utf8").toString("base64");
+}
+
+function toNumber(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function toCents(v: unknown): number | null {
+  const n = toNumber(v);
+  if (n === null) return null;
+  return Math.round(n * 100);
+}
+
+/** ---------------- Token ---------------- */
+const TokenResponseSchema = z
+  .object({
+    access_token: z.string(),
+    token_type: z.string().optional(),
+    expires_in: z.union([z.number(), z.string()]).optional(),
+    scope: z.string().optional()
+  })
+  .passthrough();
+
+export type KrogerToken = {
+  access_token: string;
+  expires_in_sec: number | null;
+  scope: string | null;
+};
+
+export function parseKrogerTokenResponse(json: unknown): KrogerToken {
+  const r = TokenResponseSchema.parse(json);
+  const exp = toNumber(r.expires_in);
+  return {
+    access_token: r.access_token,
+    expires_in_sec: exp === null ? null : Math.floor(exp),
+    scope: r.scope ?? null
+  };
+}
+
+/** ---------------- Locations ---------------- */
+const KrogerLocationSchema = z
+  .object({
+    locationId: z.string(),
+    name: z.string().optional().nullable(),
+    chain: z.string().optional().nullable(),
+    geolocation: z
+      .object({
+        latitude: z.union([z.number(), z.string()]).optional(),
+        longitude: z.union([z.number(), z.string()]).optional()
+      })
+      .optional()
+      .nullable(),
+    latitude: z.union([z.number(), z.string()]).optional(),
+    longitude: z.union([z.number(), z.string()]).optional()
+  })
+  .passthrough();
+
+const KrogerLocationsResponseSchema = z
+  .object({
+    data: z.array(KrogerLocationSchema).default([])
+  })
+  .passthrough();
+
+export type KrogerLocation = {
+  locationId: string;
+  name: string | null;
+  chain: string | null;
+  lat: number;
+  lon: number;
+};
+
+export function parseKrogerLocationsResponse(json: unknown): KrogerLocation[] {
+  const r = KrogerLocationsResponseSchema.parse(json);
+  const out: KrogerLocation[] = [];
+
+  for (const loc of r.data) {
+    const lat =
+      toNumber(loc.geolocation?.latitude) ??
+      toNumber(loc.latitude) ??
+      null;
+    const lon =
+      toNumber(loc.geolocation?.longitude) ??
+      toNumber(loc.longitude) ??
+      null;
+
+    if (lat === null || lon === null) continue;
+
+    out.push({
+      locationId: loc.locationId,
+      name: loc.name ?? null,
+      chain: loc.chain ?? null,
+      lat,
+      lon
+    });
+  }
+
+  return out;
+}
+
+/** ---------------- Product details ---------------- */
+const KrogerPriceSchema = z
+  .object({
+    regular: z.union([z.number(), z.string()]).optional(),
+    promo: z.union([z.number(), z.string()]).optional()
+  })
+  .passthrough();
+
+const KrogerItemSchema = z
+  .object({
+    price: KrogerPriceSchema.optional().nullable()
+  })
+  .passthrough();
+
+const KrogerProductSchema = z
+  .object({
+    upc: z.string().optional(),
+    items: z.array(KrogerItemSchema).optional().nullable()
+  })
+  .passthrough();
+
+const KrogerProductDetailsResponseSchema = z
+  .object({
+    data: z.union([KrogerProductSchema, z.array(KrogerProductSchema)]).optional()
+  })
+  .passthrough();
+
+export type KrogerProductPrice = {
+  upc: string;
+  price_cents: number | null;
+};
+
+export function parseKrogerProductDetailsResponse(json: unknown, upcFallback: string): KrogerProductPrice {
+  const r = KrogerProductDetailsResponseSchema.parse(json);
+  const data = Array.isArray(r.data) ? r.data[0] : r.data;
+  if (!data) return { upc: upcFallback, price_cents: null };
+
+  const upc = data.upc ?? upcFallback;
+  const item = data.items?.[0];
+  const price = item?.price ?? null;
+
+  const promo = price ? toCents(price.promo) : null;
+  const regular = price ? toCents(price.regular) : null;
+
+  return { upc, price_cents: promo ?? regular ?? null };
+}
+
+/** ---------------- HTTP calls (with circuit breaker) ---------------- */
+export async function fetchKrogerToken(
+  db: D1Database,
+  opts: {
+    client_id: string;
+    client_secret: string;
+    token_url?: string;
+    scope?: string;
+    user_agent?: string;
+    referer?: string;
+  }
+): Promise<KrogerToken> {
+  if (await isOpen(db, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
+
+  const tokenUrl = opts.token_url ?? "https://api.kroger.com/v1/connect/oauth2/token";
+  const scope = opts.scope ?? "product.compact";
+  const auth = b64(`${opts.client_id}:${opts.client_secret}`);
+
+  try {
+    const res = await fetch(tokenUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${auth}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+        ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
+        ...(opts.referer ? { Referer: opts.referer } : {})
+      },
+      body: new URLSearchParams({
+        grant_type: "client_credentials",
+        scope
+      }).toString()
+    });
+
+    const text = await res.text();
+    if (!res.ok) throw new Error(`KROGER_TOKEN_HTTP_${res.status}: ${text.slice(0, 300)}`);
+
+    const json = JSON.parse(text);
+    const parsed = parseKrogerTokenResponse(json);
+    await recordSuccess(db, PROVIDER);
+    return parsed;
+  } catch (e) {
+    await recordFailure(db, PROVIDER);
+    throw e;
+  }
+}
+
+export async function fetchKrogerLocations(
+  db: D1Database,
+  opts: {
+    access_token: string;
+    base_url?: string;
+    lat: number;
+    lon: number;
+    radius_miles?: number;
+    limit?: number;
+    user_agent?: string;
+    referer?: string;
+  }
+): Promise<KrogerLocation[]> {
+  if (await isOpen(db, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
+
+  const baseUrl = opts.base_url ?? "https://api.kroger.com/v1";
+  const radius = opts.radius_miles ?? 2;
+  const limit = opts.limit ?? 10;
+
+  const url = new URL(`${baseUrl}/locations`);
+  url.searchParams.set("filter.latLong.near", `${opts.lat},${opts.lon}`);
+  url.searchParams.set("filter.radiusInMiles", String(radius));
+  url.searchParams.set("filter.limit", String(limit));
+
+  try {
+    const res = await fetch(url.toString(), {
+      headers: {
+        Authorization: `Bearer ${opts.access_token}`,
+        Accept: "application/json",
+        ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
+        ...(opts.referer ? { Referer: opts.referer } : {})
+      }
+    });
+
+    const text = await res.text();
+    if (!res.ok) throw new Error(`KROGER_LOCATIONS_HTTP_${res.status}: ${text.slice(0, 300)}`);
+
+    const json = JSON.parse(text);
+    const parsed = parseKrogerLocationsResponse(json);
+    await recordSuccess(db, PROVIDER);
+    return parsed;
+  } catch (e) {
+    await recordFailure(db, PROVIDER);
+    throw e;
+  }
+}
+
+export async function fetchKrogerProductDetails(
+  db: D1Database,
+  opts: {
+    access_token: string;
+    base_url?: string;
+    location_id: string;
+    upc: string;
+    user_agent?: string;
+    referer?: string;
+  }
+): Promise<KrogerProductPrice> {
+  if (await isOpen(db, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
+
+  const baseUrl = opts.base_url ?? "https://api.kroger.com/v1";
+  const url = new URL(`${baseUrl}/products/${encodeURIComponent(opts.upc)}`);
+  url.searchParams.set("filter.locationId", opts.location_id);
+
+  try {
+    const res = await fetch(url.toString(), {
+      headers: {
+        Authorization: `Bearer ${opts.access_token}`,
+        Accept: "application/json",
+        ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
+        ...(opts.referer ? { Referer: opts.referer } : {})
+      }
+    });
+
+    const text = await res.text();
+    if (!res.ok) throw new Error(`KROGER_PRODUCT_HTTP_${res.status}: ${text.slice(0, 300)}`);
+
+    const json = JSON.parse(text);
+    const parsed = parseKrogerProductDetailsResponse(json, opts.upc);
+    await recordSuccess(db, PROVIDER);
+    return parsed;
+  } catch (e) {
+    await recordFailure(db, PROVIDER);
+    throw e;
+  }
 }
 </file>
 
@@ -1166,6 +1539,260 @@ export async function clearCart(env: EnvLike, session_id: string): Promise<Cart>
 }
 </file>
 
+<file path="apps/api/src/services/krogerLivePrices.ts">
+import { cacheGet, cachePut } from "../lib/cache";
+import { distanceMeters } from "../lib/geo";
+import { takeToken } from "../lib/rateLimit";
+import { nowSec } from "../lib/time";
+import {
+  fetchKrogerLocations,
+  fetchKrogerProductDetails,
+  fetchKrogerToken,
+  type KrogerLocation
+} from "../providers/kroger";
+
+type EnvLike = {
+  DB: D1Database;
+  OUTBOUND_USER_AGENT?: string;
+  OUTBOUND_REFERER?: string;
+
+  KROGER_LIVE_PRICES_ENABLED?: string;
+  KROGER_CLIENT_ID?: string;
+  KROGER_CLIENT_SECRET?: string;
+  KROGER_BASE_URL?: string;
+  KROGER_TOKEN_URL?: string;
+};
+
+export type LivePriceOverlayInput = {
+  session_id: string;
+  store: {
+    id: string;
+    name: string;
+    lat: number;
+    lon: number;
+    tags: Record<string, unknown>;
+  };
+  upcs: string[];
+  t: number;
+};
+
+export type LivePriceOverlayResult = {
+  prices_by_upc: Map<string, { price_cents: number; observed_at: number; confidence: number }>;
+  warnings: string[];
+};
+
+const MAX_UPCS_PER_QUOTE = 25;
+
+const TOKEN_CACHE_KEY = "kroger:token:product.compact";
+const TOKEN_MIN_TTL_SEC = 60;
+
+const PRICE_CACHE_TTL_SEC = 10 * 60; // 10 minutes
+const LOCATION_CACHE_MIN_FRESH_SEC = 90 * 24 * 60 * 60; // 90 days
+
+const LOCATION_RADIUS_MILES = 2;
+const MATCH_THRESHOLD_METERS = 700; // conservative match threshold
+
+// Budgets (per session)
+const RL_LOCATIONS = { capacity: 3, refillPerSec: 1 / 30, cost: 1 };
+const RL_PRODUCTS  = { capacity: 25, refillPerSec: 1 / 2, cost: 1 };
+const RL_TOKEN     = { capacity: 2, refillPerSec: 1 / 60, cost: 1 };
+
+function isEnabled(env: EnvLike) {
+  const v = (env.KROGER_LIVE_PRICES_ENABLED ?? "").toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+
+function hasCreds(env: EnvLike) {
+  return !!(env.KROGER_CLIENT_ID && env.KROGER_CLIENT_SECRET);
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let idx = 0;
+
+  const workers = new Array(Math.max(1, limit)).fill(null).map(async () => {
+    while (true) {
+      const i = idx++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i]);
+    }
+  });
+
+  await Promise.all(workers);
+  return out;
+}
+
+async function getAccessToken(env: EnvLike, session_id: string): Promise<string> {
+  const cached = await cacheGet<{ access_token: string; expires_at: number }>(env.DB, TOKEN_CACHE_KEY);
+  const now = nowSec();
+  if (cached && cached.expires_at > now + TOKEN_MIN_TTL_SEC) return cached.access_token;
+
+  const ok = await takeToken(env.DB, `kroger:${session_id}:token`, RL_TOKEN);
+  if (!ok) throw new Error("KROGER_RATE_LIMITED_TOKEN");
+
+  const token = await fetchKrogerToken(env.DB, {
+    client_id: env.KROGER_CLIENT_ID!,
+    client_secret: env.KROGER_CLIENT_SECRET!,
+    token_url: env.KROGER_TOKEN_URL,
+    scope: "product.compact",
+    user_agent: env.OUTBOUND_USER_AGENT,
+    referer: env.OUTBOUND_REFERER
+  });
+
+  const ttl = Math.max(TOKEN_MIN_TTL_SEC, (token.expires_in_sec ?? 1800) - 60);
+  const payload = {
+    access_token: token.access_token,
+    expires_at: now + ttl
+  };
+  await cachePut(env.DB, TOKEN_CACHE_KEY, payload, ttl);
+
+  return token.access_token;
+}
+
+async function getMappedLocationId(env: EnvLike, store_id: string): Promise<string | null> {
+  const row = await env.DB.prepare(
+    `SELECT provider_location_id, verified_at
+     FROM store_provider_mappings
+     WHERE store_id = ? AND provider = 'kroger'
+     LIMIT 1`
+  )
+    .bind(store_id)
+    .first<{ provider_location_id: string; verified_at: number }>();
+
+  if (!row) return null;
+  if (nowSec() - row.verified_at < LOCATION_CACHE_MIN_FRESH_SEC) return row.provider_location_id;
+  return null;
+}
+
+async function upsertLocationId(
+  env: EnvLike,
+  store_id: string,
+  location_id: string,
+  match_method: string,
+  match_score: number
+) {
+  const t = nowSec();
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO store_provider_mappings
+      (store_id, provider, provider_location_id, match_method, match_score, created_at, verified_at)
+     VALUES (?, 'kroger', ?, ?, ?, COALESCE((SELECT created_at FROM store_provider_mappings WHERE store_id = ? AND provider='kroger'), ?), ?)`
+  )
+    .bind(store_id, location_id, match_method, match_score, store_id, t, t)
+    .run();
+}
+
+function pickBestLocation(store: LivePriceOverlayInput["store"], locations: KrogerLocation[]) {
+  let best: { location: KrogerLocation; dist_m: number } | null = null;
+  for (const loc of locations) {
+    const d = distanceMeters(store.lat, store.lon, loc.lat, loc.lon);
+    if (!best || d < best.dist_m) best = { location: loc, dist_m: d };
+  }
+  return best;
+}
+
+async function resolveLocationId(env: EnvLike, input: LivePriceOverlayInput): Promise<string | null> {
+  const memo = await getMappedLocationId(env, input.store.id);
+  if (memo) return memo;
+
+  const ok = await takeToken(env.DB, `kroger:${input.session_id}:locations`, RL_LOCATIONS);
+  if (!ok) return null;
+
+  const token = await getAccessToken(env, input.session_id);
+  const locations = await fetchKrogerLocations(env.DB, {
+    access_token: token,
+    base_url: env.KROGER_BASE_URL,
+    lat: input.store.lat,
+    lon: input.store.lon,
+    radius_miles: LOCATION_RADIUS_MILES,
+    limit: 10,
+    user_agent: env.OUTBOUND_USER_AGENT,
+    referer: env.OUTBOUND_REFERER
+  });
+
+  const best = pickBestLocation(input.store, locations);
+  if (!best) return null;
+
+  if (best.dist_m > MATCH_THRESHOLD_METERS) return null;
+
+  const score = Math.max(0, 1 - best.dist_m / MATCH_THRESHOLD_METERS);
+  await upsertLocationId(env, input.store.id, best.location.locationId, "auto_nearest", score);
+  return best.location.locationId;
+}
+
+export async function getKrogerLivePriceOverlay(env: EnvLike, input: LivePriceOverlayInput): Promise<LivePriceOverlayResult> {
+  const warnings: string[] = [];
+  const prices_by_upc = new Map<string, { price_cents: number; observed_at: number; confidence: number }>();
+
+  if (!isEnabled(env)) return { prices_by_upc, warnings };
+  if (!hasCreds(env)) {
+    warnings.push("KROGER_MISCONFIGURED_MISSING_CREDS");
+    return { prices_by_upc, warnings };
+  }
+
+  const upcs = input.upcs.slice(0, MAX_UPCS_PER_QUOTE);
+
+  let locationId: string | null = null;
+  try {
+    locationId = await resolveLocationId(env, input);
+  } catch {
+    warnings.push("KROGER_UNAVAILABLE_LOCATION_LOOKUP");
+    return { prices_by_upc, warnings };
+  }
+  if (!locationId) return { prices_by_upc, warnings };
+
+  let token: string;
+  try {
+    token = await getAccessToken(env, input.session_id);
+  } catch {
+    warnings.push("KROGER_UNAVAILABLE_AUTH");
+    return { prices_by_upc, warnings };
+  }
+
+  const observed_at = nowSec();
+  let partial = false;
+
+  await mapLimit(upcs, 4, async (upc) => {
+    const cacheKey = `kroger:price:${locationId}:${upc}`;
+    const cached = await cacheGet<{ price_cents: number; observed_at: number }>(env.DB, cacheKey);
+
+    if (cached && Number.isFinite(cached.price_cents)) {
+      prices_by_upc.set(upc, { price_cents: cached.price_cents, observed_at: cached.observed_at, confidence: 0.95 });
+      return;
+    }
+
+    const ok = await takeToken(env.DB, `kroger:${input.session_id}:products`, RL_PRODUCTS);
+    if (!ok) {
+      partial = true;
+      return;
+    }
+
+    try {
+      const r = await fetchKrogerProductDetails(env.DB, {
+        access_token: token,
+        base_url: env.KROGER_BASE_URL,
+        location_id: locationId!,
+        upc,
+        user_agent: env.OUTBOUND_USER_AGENT,
+        referer: env.OUTBOUND_REFERER
+      });
+
+      if (r.price_cents == null) {
+        partial = true;
+        return;
+      }
+
+      await cachePut(env.DB, cacheKey, { price_cents: r.price_cents, observed_at }, PRICE_CACHE_TTL_SEC);
+      prices_by_upc.set(upc, { price_cents: r.price_cents, observed_at, confidence: 0.95 });
+    } catch {
+      partial = true;
+    }
+  });
+
+  if (partial) warnings.push("KROGER_PARTIAL_OR_RATE_LIMITED");
+  return { prices_by_upc, warnings };
+}
+</file>
+
 <file path="apps/api/src/services/pricing.test.ts">
 import { describe, expect, it } from "vitest";
 
@@ -1181,298 +1808,6 @@ describe("pricing helpers", () => {
     expect(adjustedTotal(1000, 0.25)).toBe(4000);
   });
 });
-</file>
-
-<file path="apps/api/src/services/pricing.ts">
-import type { CartQuoteResponse, EvidenceType, FreshnessBucket, PriceSource } from "@pricecart/shared";
-import { takeToken } from "../lib/rateLimit";
-import { nowSec } from "../lib/time";
-
-type EnvLike = { DB: D1Database };
-
-const RL_QUOTE = { capacity: 60, refillPerSec: 1 / 2, cost: 1 };   // ~60/min/session
-const RL_SUBMIT = { capacity: 20, refillPerSec: 1 / 60, cost: 1 }; // ~20/min/session
-
-type CartItemRow = { upc: string; quantity: number };
-
-type StoreRow = { id: string; name: string };
-
-type PriceRow = {
-  upc: string;
-  price_cents: number;
-  currency: string;
-  observed_at: number;
-  source: PriceSource;
-  evidence_type: EvidenceType;
-  confidence: number;
-};
-
-function clamp01(x: number): number {
-  if (x < 0) return 0;
-  if (x > 1) return 1;
-  return x;
-}
-
-function freshnessBucket(now: number, observedAt: number): FreshnessBucket {
-  const ageSec = Math.max(0, now - observedAt);
-  const ageDays = ageSec / 86400;
-  if (ageDays <= 2) return "fresh";
-  if (ageDays <= 7) return "recent";
-  if (ageDays <= 30) return "stale";
-  return "old";
-}
-
-function adjustedTotal(total: number, completeness: number): number {
-  // Penalize missing items. If completeness is low, the total is less trustworthy.
-  // This keeps ranking honest: a store missing half the prices should not “win” by default.
-  const denom = Math.max(0.25, completeness);
-  return Math.round(total / denom);
-}
-
-function median(nums: number[]): number | null {
-  if (nums.length === 0) return null;
-  const a = [...nums].sort((x, y) => x - y);
-  const mid = Math.floor(a.length / 2);
-  return a.length % 2 === 1 ? a[mid] : Math.round((a[mid - 1] + a[mid]) / 2);
-}
-
-export async function quoteCart(
-  env: EnvLike,
-  input: { session_id: string; store_ids: string[] }
-): Promise<CartQuoteResponse> {
-  const ok = await takeToken(env.DB, `quote:${input.session_id}`, RL_QUOTE);
-  if (!ok) throw new Error("RATE_LIMITED");
-
-  const storeIds = Array.from(new Set(input.store_ids)).slice(0, 20);
-
-  // Load cart items (server-backed)
-  const cartRows = await env.DB.prepare(
-    `SELECT upc, quantity
-     FROM cart_items
-     WHERE session_id = ?
-     ORDER BY updated_at DESC`
-  )
-    .bind(input.session_id)
-    .all<CartItemRow>();
-
-  const cartItems = cartRows.results;
-  const itemCount = cartItems.length;
-
-  const t = nowSec();
-  const warnings: string[] = [];
-
-  if (itemCount === 0) {
-    warnings.push("CART_EMPTY");
-  }
-
-  // Load store names
-  const storePlaceholders = storeIds.map(() => "?").join(",");
-  const storeRows = await env.DB.prepare(
-    `SELECT id, name FROM stores WHERE id IN (${storePlaceholders})`
-  )
-    .bind(...storeIds)
-    .all<StoreRow>();
-
-  const storesById = new Map(storeRows.results.map((s) => [s.id, s]));
-  const resolvedStoreIds = storeIds.filter((id) => storesById.has(id));
-  const missingStores = storeIds.filter((id) => !storesById.has(id));
-  if (missingStores.length) warnings.push(`UNKNOWN_STORES:${missingStores.join(",")}`);
-
-  const upcs = cartItems.map((c) => c.upc);
-
-  const outStores = [] as CartQuoteResponse["stores"];
-
-  for (const store_id of resolvedStoreIds) {
-    const store = storesById.get(store_id)!;
-
-    const priceMap = new Map<string, PriceRow>();
-
-    if (upcs.length > 0) {
-      const inPlaceholders = upcs.map(() => "?").join(",");
-      // Window function: pick the “best” row per UPC by observed_at then confidence
-      const rows = await env.DB.prepare(
-        `SELECT upc, price_cents, currency, observed_at, source, evidence_type, confidence
-         FROM (
-           SELECT
-             upc, price_cents, currency, observed_at, source, evidence_type, confidence,
-             ROW_NUMBER() OVER (PARTITION BY upc ORDER BY observed_at DESC, confidence DESC) AS rn
-           FROM price_snapshots
-           WHERE store_id = ? AND upc IN (${inPlaceholders})
-         )
-         WHERE rn = 1`
-      )
-        .bind(store_id, ...upcs)
-        .all<PriceRow>();
-
-      for (const r of rows.results) priceMap.set(r.upc, r);
-    }
-
-    let total = 0;
-    let matched = 0;
-    let missing = 0;
-
-    const lines = cartItems.map((it) => {
-      const p = priceMap.get(it.upc);
-      if (!p) {
-        missing += 1;
-        return {
-          upc: it.upc,
-          quantity: it.quantity,
-          unit_price_cents: null,
-          extended_price_cents: null,
-          missing: true,
-          observed_at: null,
-          source: null,
-          evidence_type: null,
-          confidence: null,
-          freshness: null
-        };
-      }
-
-      matched += 1;
-      const ext = p.price_cents * it.quantity;
-      total += ext;
-
-      return {
-        upc: it.upc,
-        quantity: it.quantity,
-        unit_price_cents: p.price_cents,
-        extended_price_cents: ext,
-        missing: false,
-        observed_at: p.observed_at,
-        source: p.source,
-        evidence_type: p.evidence_type,
-        confidence: clamp01(p.confidence),
-        freshness: freshnessBucket(t, p.observed_at)
-      };
-    });
-
-    const completeness = itemCount === 0 ? 0 : matched / itemCount;
-
-    outStores.push({
-      store_id,
-      store_name: store.name,
-      currency: "USD",
-      item_count: itemCount,
-      matched_count: matched,
-      missing_count: missing,
-      completeness,
-      total_cents: total,
-      adjusted_total_cents: adjustedTotal(total, completeness),
-      lines
-    });
-  }
-
-  // Choose cheapest: prefer higher completeness, then lower adjusted total
-  const ranked = [...outStores].sort((a, b) => {
-    if (a.completeness !== b.completeness) return b.completeness - a.completeness;
-    if (a.adjusted_total_cents !== b.adjusted_total_cents) return a.adjusted_total_cents - b.adjusted_total_cents;
-    return a.total_cents - b.total_cents;
-  });
-
-  const cheapest = ranked.length ? ranked[0] : null;
-
-  return {
-    session_id: input.session_id,
-    generated_at: t,
-    currency: "USD",
-    cheapest_store_id: cheapest ? cheapest.store_id : null,
-    stores: outStores,
-    warnings
-  };
-}
-
-export async function submitPrice(
-  env: EnvLike,
-  input: {
-    session_id: string;
-    store_id: string;
-    upc: string;
-    price_cents: number;
-    currency: string;
-    observed_at?: number;
-    evidence_type: EvidenceType;
-  }
-): Promise<{ snapshot_id: string }> {
-  const ok = await takeToken(env.DB, `price_submit:${input.session_id}`, RL_SUBMIT);
-  if (!ok) throw new Error("RATE_LIMITED");
-
-  // Store must exist
-  const store = await env.DB.prepare("SELECT id FROM stores WHERE id = ?")
-    .bind(input.store_id)
-    .first<{ id: string }>();
-  if (!store) throw new Error("STORE_NOT_FOUND");
-
-  // Product must exist
-  const prod = await env.DB.prepare("SELECT upc FROM products WHERE upc = ?")
-    .bind(input.upc)
-    .first<{ upc: string }>();
-  if (!prod) throw new Error("PRODUCT_NOT_FOUND");
-
-  const t = nowSec();
-  const observedAt = input.observed_at ?? t;
-
-  // Basic time sanity: allow small clock skew, but block far-future timestamps
-  if (observedAt > t + 86400) throw new Error("OBSERVED_AT_IN_FUTURE");
-
-  // Dedupe identical spam: same price within 1 hour
-  const dup = await env.DB.prepare(
-    `SELECT id FROM price_snapshots
-     WHERE store_id = ? AND upc = ? AND price_cents = ?
-       AND ABS(observed_at - ?) <= 3600
-     LIMIT 1`
-  )
-    .bind(input.store_id, input.upc, input.price_cents, observedAt)
-    .first<{ id: string }>();
-
-  if (dup?.id) return { snapshot_id: dup.id };
-
-  // Outlier check vs median recent history for this store+UPC
-  const hist = await env.DB.prepare(
-    `SELECT price_cents FROM price_snapshots
-     WHERE store_id = ? AND upc = ?
-     ORDER BY observed_at DESC
-     LIMIT 25`
-  )
-    .bind(input.store_id, input.upc)
-    .all<{ price_cents: number }>();
-
-  const med = median(hist.results.map((r) => r.price_cents));
-  if (med !== null) {
-    if (input.price_cents < Math.floor(med * 0.3) || input.price_cents > Math.ceil(med * 3.0)) {
-      throw new Error("OUTLIER_PRICE");
-    }
-  }
-
-  const confidenceBase = input.evidence_type === "receipt_text" ? 0.6 : 0.45;
-  const confidence = clamp01(confidenceBase);
-
-  const id = crypto.randomUUID();
-
-  await env.DB.prepare(
-    `INSERT INTO price_snapshots (
-      id, store_id, upc, price_cents, currency, observed_at, source, evidence_type,
-      confidence, submitter_session_id, flags_json, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  )
-    .bind(
-      id,
-      input.store_id,
-      input.upc,
-      input.price_cents,
-      input.currency,
-      observedAt,
-      "community",
-      input.evidence_type,
-      confidence,
-      input.session_id,
-      null,
-      t
-    )
-    .run();
-
-  return { snapshot_id: id };
-}
 </file>
 
 <file path="apps/api/src/services/productCatalog.ts">
@@ -2157,15 +2492,6 @@ function App() {
 }
 
 export default App
-</file>
-
-<file path="apps/api/src/env.ts">
-export type Env = {
-  DB: D1Database;
-  OUTBOUND_USER_AGENT?: string;
-  OUTBOUND_REFERER?: string;
-  OFF_BASE_URL?: string; // optional, defaults to https://world.openfoodfacts.org
-};
 </file>
 
 <file path="apps/api/src/index.css">
@@ -3522,6 +3848,357 @@ export function cors(allowedOrigin: string): MiddlewareHandler {
 }
 </file>
 
+<file path="apps/api/src/services/pricing.ts">
+import type { CartQuoteResponse, EvidenceType, FreshnessBucket, PriceSource } from "@pricecart/shared";
+import { takeToken } from "../lib/rateLimit";
+import { nowSec } from "../lib/time";
+import { getKrogerLivePriceOverlay } from "./krogerLivePrices";
+
+type EnvLike = {
+  DB: D1Database;
+  OUTBOUND_USER_AGENT?: string;
+  OUTBOUND_REFERER?: string;
+
+  KROGER_LIVE_PRICES_ENABLED?: string;
+  KROGER_CLIENT_ID?: string;
+  KROGER_CLIENT_SECRET?: string;
+  KROGER_BASE_URL?: string;
+  KROGER_TOKEN_URL?: string;
+};
+
+const RL_QUOTE = { capacity: 60, refillPerSec: 1 / 2, cost: 1 };   // ~60/min/session
+const RL_SUBMIT = { capacity: 20, refillPerSec: 1 / 60, cost: 1 }; // ~20/min/session
+
+type CartItemRow = { upc: string; quantity: number };
+
+type StoreRow = { id: string; name: string; lat: number; lon: number; tags_json: string | null };
+
+type PriceRow = {
+  upc: string;
+  price_cents: number;
+  currency: string;
+  observed_at: number;
+  source: PriceSource;
+  evidence_type: EvidenceType;
+  confidence: number;
+};
+
+function clamp01(x: number): number {
+  if (x < 0) return 0;
+  if (x > 1) return 1;
+  return x;
+}
+
+function freshnessBucket(now: number, observedAt: number): FreshnessBucket {
+  const ageSec = Math.max(0, now - observedAt);
+  const ageDays = ageSec / 86400;
+  if (ageDays <= 2) return "fresh";
+  if (ageDays <= 7) return "recent";
+  if (ageDays <= 30) return "stale";
+  return "old";
+}
+
+function adjustedTotal(total: number, completeness: number): number {
+  // Penalize missing items. If completeness is low, the total is less trustworthy.
+  // This keeps ranking honest: a store missing half the prices should not “win” by default.
+  const denom = Math.max(0.25, completeness);
+  return Math.round(total / denom);
+}
+
+function median(nums: number[]): number | null {
+  if (nums.length === 0) return null;
+  const a = [...nums].sort((x, y) => x - y);
+  const mid = Math.floor(a.length / 2);
+  return a.length % 2 === 1 ? a[mid] : Math.round((a[mid - 1] + a[mid]) / 2);
+}
+
+export async function quoteCart(
+  env: EnvLike,
+  input: { session_id: string; store_ids: string[] }
+): Promise<CartQuoteResponse> {
+  const ok = await takeToken(env.DB, `quote:${input.session_id}`, RL_QUOTE);
+  if (!ok) throw new Error("RATE_LIMITED");
+
+  const storeIds = Array.from(new Set(input.store_ids)).slice(0, 20);
+
+  // Load cart items (server-backed)
+  const cartRows = await env.DB.prepare(
+    `SELECT upc, quantity
+     FROM cart_items
+     WHERE session_id = ?
+     ORDER BY updated_at DESC`
+  )
+    .bind(input.session_id)
+    .all<CartItemRow>();
+
+  const cartItems = cartRows.results;
+  const itemCount = cartItems.length;
+
+  const t = nowSec();
+  const warnings: string[] = [];
+
+  if (itemCount === 0) {
+    warnings.push("CART_EMPTY");
+  }
+
+  // Load store names
+  const storePlaceholders = storeIds.map(() => "?").join(",");
+  const storeRows = await env.DB.prepare(
+    `SELECT id, name, lat, lon, tags_json FROM stores WHERE id IN (${storePlaceholders})`
+  )
+    .bind(...storeIds)
+    .all<StoreRow>();
+
+  const storesById = new Map(storeRows.results.map((s) => [s.id, s]));
+  const resolvedStoreIds = storeIds.filter((id) => storesById.has(id));
+  const missingStores = storeIds.filter((id) => !storesById.has(id));
+  if (missingStores.length) warnings.push(`UNKNOWN_STORES:${missingStores.join(",")}`);
+
+  const upcs = cartItems.map((c) => c.upc);
+
+  const outStores = [] as CartQuoteResponse["stores"];
+
+  for (const store_id of resolvedStoreIds) {
+    const store = storesById.get(store_id)!;
+
+    const priceMap = new Map<string, PriceRow>();
+
+    if (upcs.length > 0) {
+      const inPlaceholders = upcs.map(() => "?").join(",");
+      // Window function: pick the “best” row per UPC by observed_at then confidence
+      const rows = await env.DB.prepare(
+        `SELECT upc, price_cents, currency, observed_at, source, evidence_type, confidence
+         FROM (
+           SELECT
+             upc, price_cents, currency, observed_at, source, evidence_type, confidence,
+             ROW_NUMBER() OVER (PARTITION BY upc ORDER BY observed_at DESC, confidence DESC) AS rn
+           FROM price_snapshots
+           WHERE store_id = ? AND upc IN (${inPlaceholders})
+         )
+         WHERE rn = 1`
+      )
+        .bind(store_id, ...upcs)
+        .all<PriceRow>();
+
+      for (const r of rows.results) priceMap.set(r.upc, r);
+
+      
+    }
+    
+    // Optional live-price overlay (Phase 5). Default off via env flag.
+    const overlay = await getKrogerLivePriceOverlay(env, {
+      session_id: input.session_id,
+      store: { id: store_id, name: store.name, lat: store.lat, lon: store.lon, tags: store.tags_json ? JSON.parse(store.tags_json) : {} },
+      upcs,
+      t
+    });
+    if (overlay.warnings.length) warnings.push(...overlay.warnings);
+
+    // Overwrite snapshot prices with live prices when available
+    if (overlay.prices_by_upc.size) {
+      for (const [upc, live] of overlay.prices_by_upc) {
+        priceMap.set(upc, {
+          upc,
+          price_cents: live.price_cents,
+          currency: "USD",
+          observed_at: live.observed_at,
+          source: "kroger",
+          evidence_type: "dataset",
+          confidence: live.confidence
+        });
+      }
+    }
+
+
+
+    let total = 0;
+    let matched = 0;
+    let missing = 0;
+
+    const lines = cartItems.map((it) => {
+      const p = priceMap.get(it.upc);
+      if (!p) {
+        missing += 1;
+        return {
+          upc: it.upc,
+          quantity: it.quantity,
+          unit_price_cents: null,
+          extended_price_cents: null,
+          missing: true,
+          observed_at: null,
+          source: null,
+          evidence_type: null,
+          confidence: null,
+          freshness: null
+        };
+      }
+
+      matched += 1;
+      const ext = p.price_cents * it.quantity;
+      total += ext;
+
+      return {
+        upc: it.upc,
+        quantity: it.quantity,
+        unit_price_cents: p.price_cents,
+        extended_price_cents: ext,
+        missing: false,
+        observed_at: p.observed_at,
+        source: p.source,
+        evidence_type: p.evidence_type,
+        confidence: clamp01(p.confidence),
+        freshness: freshnessBucket(t, p.observed_at)
+      };
+    });
+
+    const completeness = itemCount === 0 ? 0 : matched / itemCount;
+
+    outStores.push({
+      store_id,
+      store_name: store.name,
+      currency: "USD",
+      item_count: itemCount,
+      matched_count: matched,
+      missing_count: missing,
+      completeness,
+      total_cents: total,
+      adjusted_total_cents: adjustedTotal(total, completeness),
+      lines
+    });
+  }
+
+  // Choose cheapest: prefer higher completeness, then lower adjusted total
+  const ranked = [...outStores].sort((a, b) => {
+    if (a.completeness !== b.completeness) return b.completeness - a.completeness;
+    if (a.adjusted_total_cents !== b.adjusted_total_cents) return a.adjusted_total_cents - b.adjusted_total_cents;
+    return a.total_cents - b.total_cents;
+  });
+
+  const cheapest = ranked.length ? ranked[0] : null;
+
+  return {
+    session_id: input.session_id,
+    generated_at: t,
+    currency: "USD",
+    cheapest_store_id: cheapest ? cheapest.store_id : null,
+    stores: outStores,
+    warnings
+  };
+}
+
+export async function submitPrice(
+  env: EnvLike,
+  input: {
+    session_id: string;
+    store_id: string;
+    upc: string;
+    price_cents: number;
+    currency: string;
+    observed_at?: number;
+    evidence_type: EvidenceType;
+  }
+): Promise<{ snapshot_id: string }> {
+  const ok = await takeToken(env.DB, `price_submit:${input.session_id}`, RL_SUBMIT);
+  if (!ok) throw new Error("RATE_LIMITED");
+
+  // Store must exist
+  const store = await env.DB.prepare("SELECT id FROM stores WHERE id = ?")
+    .bind(input.store_id)
+    .first<{ id: string }>();
+  if (!store) throw new Error("STORE_NOT_FOUND");
+
+  // Product must exist
+  const prod = await env.DB.prepare("SELECT upc FROM products WHERE upc = ?")
+    .bind(input.upc)
+    .first<{ upc: string }>();
+  if (!prod) throw new Error("PRODUCT_NOT_FOUND");
+
+  const t = nowSec();
+  const observedAt = input.observed_at ?? t;
+
+  // Basic time sanity: allow small clock skew, but block far-future timestamps
+  if (observedAt > t + 86400) throw new Error("OBSERVED_AT_IN_FUTURE");
+
+  // Dedupe identical spam: same price within 1 hour
+  const dup = await env.DB.prepare(
+    `SELECT id FROM price_snapshots
+     WHERE store_id = ? AND upc = ? AND price_cents = ?
+       AND ABS(observed_at - ?) <= 3600
+     LIMIT 1`
+  )
+    .bind(input.store_id, input.upc, input.price_cents, observedAt)
+    .first<{ id: string }>();
+
+  if (dup?.id) return { snapshot_id: dup.id };
+
+  // Outlier check vs median recent history for this store+UPC
+  const hist = await env.DB.prepare(
+    `SELECT price_cents FROM price_snapshots
+     WHERE store_id = ? AND upc = ?
+     ORDER BY observed_at DESC
+     LIMIT 25`
+  )
+    .bind(input.store_id, input.upc)
+    .all<{ price_cents: number }>();
+
+  const med = median(hist.results.map((r) => r.price_cents));
+  if (med !== null) {
+    if (input.price_cents < Math.floor(med * 0.3) || input.price_cents > Math.ceil(med * 3.0)) {
+      throw new Error("OUTLIER_PRICE");
+    }
+  }
+
+  const confidenceBase = input.evidence_type === "receipt_text" ? 0.6 : 0.45;
+  const confidence = clamp01(confidenceBase);
+
+  const id = crypto.randomUUID();
+
+  await env.DB.prepare(
+    `INSERT INTO price_snapshots (
+      id, store_id, upc, price_cents, currency, observed_at, source, evidence_type,
+      confidence, submitter_session_id, flags_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      id,
+      input.store_id,
+      input.upc,
+      input.price_cents,
+      input.currency,
+      observedAt,
+      "community",
+      input.evidence_type,
+      confidence,
+      input.session_id,
+      null,
+      t
+    )
+    .run();
+
+  return { snapshot_id: id };
+}
+</file>
+
+<file path="apps/api/src/env.ts">
+export type Env = {
+  DB: D1Database;
+
+  // Existing outbound headers (used by external providers)
+  OUTBOUND_USER_AGENT?: string;
+  OUTBOUND_REFERER?: string;
+
+  // Open Food Facts
+  OFF_BASE_URL?: string; // optional, defaults to https://world.openfoodfacts.org
+
+  // Phase 5 – Kroger live prices (optional, default OFF)
+  KROGER_LIVE_PRICES_ENABLED?: string; // "1" enables live price overlay
+  KROGER_CLIENT_ID?: string; // secret
+  KROGER_CLIENT_SECRET?: string; // secret
+  KROGER_BASE_URL?: string; // optional, default "https://api.kroger.com/v1"
+  KROGER_TOKEN_URL?: string; // optional, default "https://api.kroger.com/v1/connect/oauth2/token"
+};
+</file>
+
 <file path="apps/api/vite.config.ts">
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
@@ -4053,8 +4730,15 @@ export async function submitPrice(req: PriceSubmitRequest): Promise<PriceSubmitR
 }
 </file>
 
+<file path="packages/shared/src/index.ts">
+export * from "./cart.js";
+export * from "./pricing.js";
+export * from "./product.js";
+export * from "./store.js";
+</file>
+
 <file path="apps/web/src/App.tsx">
-import type { CartQuoteResponse, Product, ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
+import type { CartLine, CartQuoteResponse, Product, ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
 import "leaflet/dist/leaflet.css";
 import { useMemo, useState } from "react";
 import { MapContainer, Marker, Popup, TileLayer } from "react-leaflet";
@@ -4070,6 +4754,23 @@ function qtyLabel(p: { quantity?: { raw: string | null; value: number | null; un
   if (!q) return "";
   if (q.raw) return q.raw;
   if (q.value && q.unit) return `${q.value} ${q.unit}`;
+  return "";
+}
+
+function formatObservedAt(observedAt: number | null | undefined) {
+  if (!observedAt) return "";
+  try {
+    return new Date(observedAt * 1000).toLocaleString();
+  } catch {
+    return "";
+  }
+}
+
+function sourceLabel(source: string | null | undefined) {
+  if (source === "kroger") return "Live price (Kroger)";
+  if (source === "open_prices") return "Dataset (Open Prices)";
+  if (source === "community") return "Community";
+  if (source === "seed") return "Seed";
   return "";
 }
 
@@ -4091,6 +4792,11 @@ export default function App() {
 
   // Phase 3: Cart
   const cart = useCart();
+  const cartItemByUpc = useMemo(() => {
+    const m = new Map<string, CartLine>();
+    for (const it of cart.cart?.items ?? []) m.set(it.upc, it);
+    return m;
+  }, [cart.cart]);
   const [quote, setQuote] = useState<CartQuoteResponse | null>(null);
   const [quoteStatus, setQuoteStatus] = useState<string>("");
   const [submitStoreId, setSubmitStoreId] = useState<string>("");
@@ -4403,6 +5109,41 @@ export default function App() {
                           <div style={{ opacity: 0.8 }}>
                             Adjusted total: <b>${(s.adjusted_total_cents / 100).toFixed(2)}</b>
                           </div>
+                          <details style={{ marginTop: 8 }}>
+                            <summary>Line items</summary>
+                            <ul style={{ paddingLeft: 16, marginTop: 8, display: "grid", gap: 6 }}>
+                              {s.lines.map((ln) => {
+                                const item = cartItemByUpc.get(ln.upc);
+                                const title = item ? `${item.name}${item.brand ? ` (${item.brand})` : ""}` : ln.upc;
+                                const when = formatObservedAt(ln.observed_at ?? null);
+                                const src = sourceLabel(ln.source ?? null);
+                                const metaParts: string[] = [];
+                                if (src) metaParts.push(src);
+                                if (when) metaParts.push(when);
+                                const meta = metaParts.join(" • ");
+
+                                return (
+                                  <li key={ln.upc}>
+                                    <div>
+                                      <b>{title}</b> x{ln.quantity} {item ? qtyLabel(item) : ""}
+                                    </div>
+                                    {ln.missing ? (
+                                      <div style={{ opacity: 0.8 }}>Missing price</div>
+                                    ) : (
+                                      <div style={{ opacity: 0.9 }}>
+                                        ${(ln.extended_price_cents! / 100).toFixed(2)}{" "}
+                                        {meta && (
+                                          <span style={{ opacity: 0.75 }}>
+                                            ({meta})
+                                          </span>
+                                        )}
+                                      </div>
+                                    )}
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          </details>
                         </li>
                       ))}
                   </ul>
@@ -4456,13 +5197,6 @@ export default function App() {
     </div>
   );
 }
-</file>
-
-<file path="packages/shared/src/index.ts">
-export * from "./cart.js";
-export * from "./pricing.js";
-export * from "./product.js";
-export * from "./store.js";
 </file>
 
 </files>

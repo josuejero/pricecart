@@ -2,10 +2,18 @@ import type { CartLine, CartQuoteResponse, Product, ProductLookupResponse, Produ
 import "leaflet/dist/leaflet.css";
 import { useMemo, useState } from "react";
 import { MapContainer, Marker, Popup, TileLayer } from "react-leaflet";
-import { fetchStores, lookupProductByUpc, quoteCart, searchProducts, submitPrice } from "./lib/api";
+import { ApiError, fetchStores, lookupProductByUpc, quoteCart, searchProducts, submitPrice } from "./lib/api";
 import { useCart } from "./lib/cart";
+import { AttributionFooter } from "./components/AttributionFooter";
 
 function formatErrorMessage(err: unknown) {
+  if (err instanceof ApiError) {
+    const friendly =
+      err.code === "RATE_LIMITED" || err.code === "HTTP_429"
+        ? "Provider is busy; please retry shortly."
+        : err.message;
+    return `${friendly} (Request ID: ${err.requestId ?? "unknown"})`;
+  }
   return err instanceof Error ? err.message : String(err);
 }
 
@@ -33,6 +41,37 @@ function sourceLabel(source: string | null | undefined) {
   if (source === "seed") return "Seed";
   return "";
 }
+
+const ATTRIBUTION_META = {
+  osm: {
+    text: "© OpenStreetMap contributors",
+    href: "https://www.openstreetmap.org/copyright"
+  },
+  nominatim: {
+    text: "Geocoding by Nominatim (OpenStreetMap)",
+    href: "https://operations.osmfoundation.org/policies/nominatim/"
+  },
+  overpass: {
+    text: "POI search via Overpass API (OpenStreetMap)",
+    href: "https://dev.overpass-api.de/overpass-doc/en/preface/commons.html"
+  },
+  openfoodfacts: {
+    text: "Data © Open Food Facts contributors",
+    href: "https://world.openfoodfacts.org/terms-of-use"
+  },
+  openprices: {
+    text: "Price data © Open Prices contributors",
+    href: "https://prices.openfoodfacts.org"
+  },
+  kroger: {
+    text: "Live prices via Kroger API (where available)",
+    href: "https://developer.kroger.com/"
+  }
+} as const;
+
+const ATTRIBUTION_ORDER = ["osm", "nominatim", "overpass", "openfoodfacts", "openprices", "kroger"] as const;
+
+type AttributionId = (typeof ATTRIBUTION_ORDER)[number];
 
 export default function App() {
   const [view, setView] = useState<"stores" | "products" | "cart">("stores");
@@ -68,6 +107,34 @@ export default function App() {
     const first = stores?.stores?.[0];
     return first ? { lat: first.lat, lon: first.lon } : { lat: 40.7484, lon: -73.9967 }; // Midtown fallback
   }, [stores]);
+
+  const attributionItems = useMemo(() => {
+    const selection = new Set<AttributionId>();
+    if (stores) {
+      selection.add("osm");
+      selection.add("nominatim");
+      selection.add("overpass");
+    }
+    if (lookup?.product || (search?.products.length ?? 0) > 0) {
+      selection.add("openfoodfacts");
+    }
+    const sources = new Set<string>();
+    for (const store of quote?.stores ?? []) {
+      for (const line of store.lines) {
+        if (line.source) sources.add(line.source);
+      }
+    }
+    if (sources.has("open_prices")) {
+      selection.add("openprices");
+    }
+    if (sources.has("kroger")) {
+      selection.add("kroger");
+    }
+
+    return ATTRIBUTION_ORDER
+      .filter((id) => selection.has(id))
+      .map((id) => ({ id, ...ATTRIBUTION_META[id] }));
+  }, [stores, lookup, quote, search]);
 
   async function onSearchStores() {
     setSStatus("Loading...");
@@ -154,13 +221,13 @@ export default function App() {
       <header style={{ display: "flex", gap: 8, alignItems: "center", justifyContent: "space-between" }}>
         <h2 style={{ margin: 0 }}>PriceCart</h2>
         <nav style={{ display: "flex", gap: 8 }}>
-          <button onClick={() => setView("stores")} disabled={view === "stores"}>
+          <button type="button" onClick={() => setView("stores")} disabled={view === "stores"}>
             Stores
           </button>
-          <button onClick={() => setView("products")} disabled={view === "products"}>
+          <button type="button" onClick={() => setView("products")} disabled={view === "products"}>
             Products
           </button>
-          <button onClick={() => setView("cart")} disabled={view === "cart"}>
+          <button type="button" onClick={() => setView("cart")} disabled={view === "cart"}>
             Cart {cart.cart ? `(${cart.cart.item_count})` : ""}
           </button>
         </nav>
@@ -185,10 +252,16 @@ export default function App() {
                 style={{ marginLeft: 8, width: 120 }}
               />
             </label>
-            <button onClick={onSearchStores}>Search</button>
+            <button type="button" onClick={onSearchStores}>
+              Search
+            </button>
           </div>
 
-          {sStatus && <p>{sStatus}</p>}
+          {sStatus && (
+            <p role="status" aria-live="polite">
+              {sStatus}
+            </p>
+          )}
 
           {stores && (
             <>
@@ -241,9 +314,13 @@ export default function App() {
                 UPC
                 <input value={upc} onChange={(e) => setUpc(e.target.value)} style={{ marginLeft: 8 }} />
               </label>
-              <button onClick={onLookupUpc}>Lookup</button>
+              <button type="button" onClick={onLookupUpc}>
+                Lookup
+              </button>
               {lookup?.product && (
-                <button onClick={() => addProductToCart(lookup.product)}>Add to cart</button>
+                <button type="button" onClick={() => addProductToCart(lookup.product)}>
+                  Add to cart
+                </button>
               )}
             </div>
 
@@ -260,10 +337,16 @@ export default function App() {
                 Search
                 <input value={q} onChange={(e) => setQ(e.target.value)} style={{ marginLeft: 8, width: 260 }} />
               </label>
-              <button onClick={onSearchProducts}>Search</button>
+              <button type="button" onClick={onSearchProducts}>
+                Search
+              </button>
             </div>
 
-            {pStatus && <p>{pStatus}</p>}
+            {pStatus && (
+              <p role="status" aria-live="polite">
+                {pStatus}
+              </p>
+            )}
 
             {search && (
               <>
@@ -276,7 +359,9 @@ export default function App() {
                       <span style={{ flex: 1 }}>
                         <b>{p.name}</b> {p.brand ? <span style={{ opacity: 0.8 }}>({p.brand})</span> : null}
                       </span>
-                      <button onClick={() => cart.add(p.upc, 1)}>Add</button>
+                      <button type="button" onClick={() => cart.add(p.upc, 1)}>
+                        Add
+                      </button>
                     </li>
                   ))}
                 </ul>
@@ -290,8 +375,16 @@ export default function App() {
         <section>
           <h3>Your cart</h3>
 
-          {cart.status === "loading" && <p>Loading...</p>}
-          {cart.status === "error" && <p>Error: {cart.error}</p>}
+          {cart.status === "loading" && (
+            <p role="status" aria-live="polite">
+              Loading...
+            </p>
+          )}
+          {cart.status === "error" && (
+            <p role="status" aria-live="polite">
+              Error: {cart.error}
+            </p>
+          )}
 
           {cart.cart && cart.cart.item_count === 0 && <p>Your cart is empty. Add items from the Products tab.</p>}
 
@@ -313,7 +406,11 @@ export default function App() {
                     </div>
 
                     <div style={{ display: "flex", gap: 8, alignItems: "center", justifyContent: "flex-end" }}>
-                      <button onClick={() => cart.setQuantity(it.upc, Math.max(1, it.count - 1))} aria-label="Decrease">
+                      <button
+                        type="button"
+                        onClick={() => cart.setQuantity(it.upc, Math.max(1, it.count - 1))}
+                        aria-label="Decrease"
+                      >
                         -
                       </button>
                       <input
@@ -324,21 +421,35 @@ export default function App() {
                         onChange={(e) => cart.setQuantity(it.upc, Math.max(1, Math.min(99, Number(e.target.value) || 1)))}
                         style={{ width: 64 }}
                       />
-                      <button onClick={() => cart.setQuantity(it.upc, Math.min(99, it.count + 1))} aria-label="Increase">
+                      <button
+                        type="button"
+                        onClick={() => cart.setQuantity(it.upc, Math.min(99, it.count + 1))}
+                        aria-label="Increase"
+                      >
                         +
                       </button>
-                      <button onClick={() => cart.remove(it.upc)}>Remove</button>
+                      <button type="button" onClick={() => cart.remove(it.upc)}>
+                        Remove
+                      </button>
                     </div>
                   </li>
                 ))}
               </ul>
 
               <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-                <button onClick={cart.clear}>Clear cart</button>
-                <button onClick={onComparePrices}>Compare prices</button>
+                <button type="button" onClick={cart.clear}>
+                  Clear cart
+                </button>
+                <button type="button" onClick={onComparePrices}>
+                  Compare prices
+                </button>
               </div>
 
-              {quoteStatus && <p>{quoteStatus}</p>}
+              {quoteStatus && (
+                <p role="status" aria-live="polite">
+                  {quoteStatus}
+                </p>
+              )}
 
               {quote && (
                 <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
@@ -438,16 +549,24 @@ export default function App() {
                       />
                     </label>
 
-                    <button onClick={onSubmitPrice}>Submit</button>
+                    <button type="button" onClick={onSubmitPrice}>
+                      Submit
+                    </button>
                   </div>
 
-                  {submitStatus && <p>{submitStatus}</p>}
+                  {submitStatus && (
+                    <p role="status" aria-live="polite">
+                      {submitStatus}
+                    </p>
+                  )}
                 </div>
               )}
             </>
           )}
         </section>
       )}
+
+      <AttributionFooter items={attributionItems} />
 
       <footer style={{ marginTop: 24, opacity: 0.75 }}>
         <small>

@@ -34,6 +34,8 @@ type EnvLike = {
   OUTBOUND_USER_AGENT?: string;
   OUTBOUND_REFERER?: string;
   OFF_BASE_URL?: string; // optional
+  METRICS_ENABLED?: string;
+  PROVIDER_TIMEOUT_MS?: string;
 };
 
 export type ProductSummary = {

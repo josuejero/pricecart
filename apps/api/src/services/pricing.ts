@@ -13,6 +13,8 @@ type EnvLike = {
   KROGER_CLIENT_SECRET?: string;
   KROGER_BASE_URL?: string;
   KROGER_TOKEN_URL?: string;
+  METRICS_ENABLED?: string;
+  PROVIDER_TIMEOUT_MS?: string;
 };
 
 const RL_QUOTE = { capacity: 60, refillPerSec: 1 / 2, cost: 1 };   // ~60/min/session

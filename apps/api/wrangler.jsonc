@@ -13,7 +13,11 @@
   "vars": {
     "OUTBOUND_USER_AGENT": "PriceCart/0.1 (contact: you@example.com)",
     "OUTBOUND_REFERER": "http://localhost:5173",
-    "OFF_BASE_URL": "https://world.openfoodfacts.org"
+    "OFF_BASE_URL": "https://world.openfoodfacts.org",
+    "INTERNAL_TOKEN": "dev-internal-token",
+    "METRICS_ENABLED": "1",
+    "METRICS_SAMPLE_RATE": "1",
+    "PROVIDER_TIMEOUT_MS": "6000"
   },
 
   "assets": {

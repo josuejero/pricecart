@@ -19,24 +19,67 @@ function apiBase(): string {
   return (import.meta as any).env?.VITE_API_BASE_URL ?? "http://localhost:8787/api";
 }
 
-async function fetchJson<T>(url: string, init: FetchJsonInit = {}): Promise<T> {
+export class ApiError extends Error {
+  constructor(
+    public readonly code: string,
+    public readonly requestId: string | null,
+    message: string
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+function newRequestId() {
+  return crypto.randomUUID();
+}
+
+async function apiFetch<T>(url: string, init: FetchJsonInit = {}) {
+  const requestId = newRequestId();
   const headers = new Headers(init.headers);
   headers.set("x-pricecart-session", getSessionId());
+  headers.set("x-request-id", requestId);
 
-  let body: BodyInit | undefined = undefined;
   if (init.json !== undefined) {
     headers.set("content-type", "application/json");
-    body = JSON.stringify(init.json);
   }
 
-  const res = await fetch(url, { ...init, headers, body });
+  const body: BodyInit | undefined =
+    init.json !== undefined ? JSON.stringify(init.json) : init.body;
+
+  const { json: _unused, ...rest } = init;
+  const res = await fetch(url, { ...rest, headers, body });
+
+  const text = await res.text();
+  let parsed: unknown = null;
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = null;
+    }
+  }
+
+  const serverRequestId = res.headers.get("x-request-id") || requestId;
 
   if (!res.ok) {
-    const payload = await res.json().catch(() => ({}));
-    throw new Error(payload?.error || `HTTP_${res.status}`);
+    const errorPayload =
+      parsed && typeof parsed === "object" && "error" in parsed ? (parsed as any).error : null;
+    const code = (errorPayload?.code as string) ?? `HTTP_${res.status}`;
+    const message =
+      (errorPayload?.message as string) ??
+      (errorPayload?.code as string) ??
+      `HTTP_${res.status}`;
+    const requestIdFromPayload = (errorPayload?.request_id as string) ?? serverRequestId;
+    throw new ApiError(code, requestIdFromPayload ?? null, message);
   }
 
-  return (await res.json()) as T;
+  return { data: parsed as T, requestId: serverRequestId };
+}
+
+async function fetchJson<T>(url: string, init: FetchJsonInit = {}): Promise<T> {
+  const { data } = await apiFetch<T>(url, init);
+  return data;
 }
 
 export async function fetchStores(params: { location: string; radius_m?: number }): Promise<StoreSearchResponse> {

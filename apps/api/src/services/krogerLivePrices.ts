@@ -19,6 +19,8 @@ type EnvLike = {
   KROGER_CLIENT_SECRET?: string;
   KROGER_BASE_URL?: string;
   KROGER_TOKEN_URL?: string;
+  METRICS_ENABLED?: string;
+  PROVIDER_TIMEOUT_MS?: string;
 };
 
 export type LivePriceOverlayInput = {
@@ -88,14 +90,14 @@ async function getAccessToken(env: EnvLike, session_id: string): Promise<string>
   const ok = await takeToken(env.DB, `kroger:${session_id}:token`, RL_TOKEN);
   if (!ok) throw new Error("KROGER_RATE_LIMITED_TOKEN");
 
-  const token = await fetchKrogerToken(env.DB, {
-    client_id: env.KROGER_CLIENT_ID!,
-    client_secret: env.KROGER_CLIENT_SECRET!,
-    token_url: env.KROGER_TOKEN_URL,
-    scope: "product.compact",
-    user_agent: env.OUTBOUND_USER_AGENT,
-    referer: env.OUTBOUND_REFERER
-  });
+    const token = await fetchKrogerToken(env, {
+      client_id: env.KROGER_CLIENT_ID!,
+      client_secret: env.KROGER_CLIENT_SECRET!,
+      token_url: env.KROGER_TOKEN_URL,
+      scope: "product.compact",
+      user_agent: env.OUTBOUND_USER_AGENT,
+      referer: env.OUTBOUND_REFERER
+    });
 
   const ttl = Math.max(TOKEN_MIN_TTL_SEC, (token.expires_in_sec ?? 1800) - 60);
   const payload = {
@@ -156,16 +158,16 @@ async function resolveLocationId(env: EnvLike, input: LivePriceOverlayInput): Pr
   if (!ok) return null;
 
   const token = await getAccessToken(env, input.session_id);
-  const locations = await fetchKrogerLocations(env.DB, {
-    access_token: token,
-    base_url: env.KROGER_BASE_URL,
-    lat: input.store.lat,
-    lon: input.store.lon,
-    radius_miles: LOCATION_RADIUS_MILES,
-    limit: 10,
-    user_agent: env.OUTBOUND_USER_AGENT,
-    referer: env.OUTBOUND_REFERER
-  });
+    const locations = await fetchKrogerLocations(env, {
+      access_token: token,
+      base_url: env.KROGER_BASE_URL,
+      lat: input.store.lat,
+      lon: input.store.lon,
+      radius_miles: LOCATION_RADIUS_MILES,
+      limit: 10,
+      user_agent: env.OUTBOUND_USER_AGENT,
+      referer: env.OUTBOUND_REFERER
+    });
 
   const best = pickBestLocation(input.store, locations);
   if (!best) return null;
@@ -225,7 +227,7 @@ export async function getKrogerLivePriceOverlay(env: EnvLike, input: LivePriceOv
     }
 
     try {
-      const r = await fetchKrogerProductDetails(env.DB, {
+      const r = await fetchKrogerProductDetails(env, {
         access_token: token,
         base_url: env.KROGER_BASE_URL,
         location_id: locationId!,

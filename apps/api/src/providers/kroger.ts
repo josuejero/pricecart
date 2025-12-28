@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { isOpen, recordFailure, recordSuccess } from "../lib/circuitBreaker";
+import { fetchWithRetry, HttpError, RetryOptions, TimeoutError } from "../lib/http";
+import { noteProviderOutcome } from "../lib/providerMetrics";
 
 const PROVIDER = "kroger";
 
@@ -22,6 +24,37 @@ function toCents(v: unknown): number | null {
   const n = toNumber(v);
   if (n === null) return null;
   return Math.round(n * 100);
+}
+
+const RETRY_OPTIONS: RetryOptions = {
+  attempts: 3,
+  baseDelayMs: 250,
+  maxDelayMs: 2000,
+  retryOnStatuses: [429, 500, 502, 503, 504]
+};
+
+type ProviderEnv = {
+  DB: D1Database;
+  OUTBOUND_USER_AGENT?: string;
+  OUTBOUND_REFERER?: string;
+  METRICS_ENABLED?: string;
+  PROVIDER_TIMEOUT_MS?: string;
+};
+
+function getTimeoutMs(env: ProviderEnv) {
+  const parsed = Number(env.PROVIDER_TIMEOUT_MS ?? "6000");
+  return Number.isFinite(parsed) ? parsed : 6000;
+}
+
+function classifyError(err: unknown): string {
+  if (err instanceof TimeoutError) return "timeout";
+  if (err instanceof HttpError) {
+    if (err.status === 429) return "rate_limited";
+    if (err.status >= 500) return "http_5xx";
+    if (err.status >= 400) return "http_4xx";
+  }
+  if (err instanceof SyntaxError) return "parse_error";
+  return "other";
 }
 
 /** ---------------- Token ---------------- */
@@ -159,7 +192,7 @@ export function parseKrogerProductDetailsResponse(json: unknown, upcFallback: st
 
 /** ---------------- HTTP calls (with circuit breaker) ---------------- */
 export async function fetchKrogerToken(
-  db: D1Database,
+  env: ProviderEnv,
   opts: {
     client_id: string;
     client_secret: string;
@@ -169,42 +202,58 @@ export async function fetchKrogerToken(
     referer?: string;
   }
 ): Promise<KrogerToken> {
-  if (await isOpen(db, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
-
+  if (await isOpen(env.DB, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
+  const enabled = env.METRICS_ENABLED === "1";
   const tokenUrl = opts.token_url ?? "https://api.kroger.com/v1/connect/oauth2/token";
   const scope = opts.scope ?? "product.compact";
   const auth = b64(`${opts.client_id}:${opts.client_secret}`);
+  const timeoutMs = getTimeoutMs(env);
 
   try {
-    const res = await fetch(tokenUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${auth}`,
-        "Content-Type": "application/x-www-form-urlencoded",
-        ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
-        ...(opts.referer ? { Referer: opts.referer } : {})
+    const res = await fetchWithRetry(
+      tokenUrl,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${auth}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+          ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
+          ...(opts.referer ? { Referer: opts.referer } : {}),
+          ...(env.OUTBOUND_USER_AGENT && !opts.user_agent ? { "User-Agent": env.OUTBOUND_USER_AGENT } : {}),
+          ...(env.OUTBOUND_REFERER && !opts.referer ? { Referer: env.OUTBOUND_REFERER } : {})
+        },
+        body: new URLSearchParams({
+          grant_type: "client_credentials",
+          scope
+        }).toString()
       },
-      body: new URLSearchParams({
-        grant_type: "client_credentials",
-        scope
-      }).toString()
-    });
+      { timeoutMs, retry: RETRY_OPTIONS, isIdempotent: true }
+    );
 
     const text = await res.text();
-    if (!res.ok) throw new Error(`KROGER_TOKEN_HTTP_${res.status}: ${text.slice(0, 300)}`);
+    if (!res.ok) {
+      throw new HttpError(`KROGER_TOKEN_HTTP_${res.status}: ${text.slice(0, 300)}`, res.status, tokenUrl);
+    }
 
     const json = JSON.parse(text);
     const parsed = parseKrogerTokenResponse(json);
-    await recordSuccess(db, PROVIDER);
+    await recordSuccess(env.DB, PROVIDER);
+    await noteProviderOutcome({ db: env.DB, enabled, provider: "kroger_token", outcome: "success" });
     return parsed;
   } catch (e) {
-    await recordFailure(db, PROVIDER);
+    await noteProviderOutcome({
+      db: env.DB,
+      enabled,
+      provider: "kroger_token",
+      outcome: classifyError(e)
+    });
+    await recordFailure(env.DB, PROVIDER);
     throw e;
   }
 }
 
 export async function fetchKrogerLocations(
-  db: D1Database,
+  env: ProviderEnv,
   opts: {
     access_token: string;
     base_url?: string;
@@ -216,8 +265,9 @@ export async function fetchKrogerLocations(
     referer?: string;
   }
 ): Promise<KrogerLocation[]> {
-  if (await isOpen(db, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
-
+  if (await isOpen(env.DB, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
+  const enabled = env.METRICS_ENABLED === "1";
+  const timeoutMs = getTimeoutMs(env);
   const baseUrl = opts.base_url ?? "https://api.kroger.com/v1";
   const radius = opts.radius_miles ?? 2;
   const limit = opts.limit ?? 10;
@@ -228,30 +278,46 @@ export async function fetchKrogerLocations(
   url.searchParams.set("filter.limit", String(limit));
 
   try {
-    const res = await fetch(url.toString(), {
-      headers: {
-        Authorization: `Bearer ${opts.access_token}`,
-        Accept: "application/json",
-        ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
-        ...(opts.referer ? { Referer: opts.referer } : {})
-      }
-    });
+    const res = await fetchWithRetry(
+      url.toString(),
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${opts.access_token}`,
+          Accept: "application/json",
+          ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
+          ...(opts.referer ? { Referer: opts.referer } : {}),
+          ...(env.OUTBOUND_USER_AGENT && !opts.user_agent ? { "User-Agent": env.OUTBOUND_USER_AGENT } : {}),
+          ...(env.OUTBOUND_REFERER && !opts.referer ? { Referer: env.OUTBOUND_REFERER } : {})
+        }
+      },
+      { timeoutMs, retry: RETRY_OPTIONS }
+    );
 
     const text = await res.text();
-    if (!res.ok) throw new Error(`KROGER_LOCATIONS_HTTP_${res.status}: ${text.slice(0, 300)}`);
+    if (!res.ok) {
+      throw new HttpError(`KROGER_LOCATIONS_HTTP_${res.status}: ${text.slice(0, 300)}`, res.status, url.toString());
+    }
 
     const json = JSON.parse(text);
     const parsed = parseKrogerLocationsResponse(json);
-    await recordSuccess(db, PROVIDER);
+    await recordSuccess(env.DB, PROVIDER);
+    await noteProviderOutcome({ db: env.DB, enabled, provider: "kroger_locations", outcome: "success" });
     return parsed;
   } catch (e) {
-    await recordFailure(db, PROVIDER);
+    await noteProviderOutcome({
+      db: env.DB,
+      enabled,
+      provider: "kroger_locations",
+      outcome: classifyError(e)
+    });
+    await recordFailure(env.DB, PROVIDER);
     throw e;
   }
 }
 
 export async function fetchKrogerProductDetails(
-  db: D1Database,
+  env: ProviderEnv,
   opts: {
     access_token: string;
     base_url?: string;
@@ -261,31 +327,48 @@ export async function fetchKrogerProductDetails(
     referer?: string;
   }
 ): Promise<KrogerProductPrice> {
-  if (await isOpen(db, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
-
+  if (await isOpen(env.DB, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
+  const enabled = env.METRICS_ENABLED === "1";
+  const timeoutMs = getTimeoutMs(env);
   const baseUrl = opts.base_url ?? "https://api.kroger.com/v1";
   const url = new URL(`${baseUrl}/products/${encodeURIComponent(opts.upc)}`);
   url.searchParams.set("filter.locationId", opts.location_id);
 
   try {
-    const res = await fetch(url.toString(), {
-      headers: {
-        Authorization: `Bearer ${opts.access_token}`,
-        Accept: "application/json",
-        ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
-        ...(opts.referer ? { Referer: opts.referer } : {})
-      }
-    });
+    const res = await fetchWithRetry(
+      url.toString(),
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${opts.access_token}`,
+          Accept: "application/json",
+          ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
+          ...(opts.referer ? { Referer: opts.referer } : {}),
+          ...(env.OUTBOUND_USER_AGENT && !opts.user_agent ? { "User-Agent": env.OUTBOUND_USER_AGENT } : {}),
+          ...(env.OUTBOUND_REFERER && !opts.referer ? { Referer: env.OUTBOUND_REFERER } : {})
+        }
+      },
+      { timeoutMs, retry: RETRY_OPTIONS }
+    );
 
     const text = await res.text();
-    if (!res.ok) throw new Error(`KROGER_PRODUCT_HTTP_${res.status}: ${text.slice(0, 300)}`);
+    if (!res.ok) {
+      throw new HttpError(`KROGER_PRODUCT_HTTP_${res.status}: ${text.slice(0, 300)}`, res.status, url.toString());
+    }
 
     const json = JSON.parse(text);
     const parsed = parseKrogerProductDetailsResponse(json, opts.upc);
-    await recordSuccess(db, PROVIDER);
+    await recordSuccess(env.DB, PROVIDER);
+    await noteProviderOutcome({ db: env.DB, enabled, provider: "kroger_products", outcome: "success" });
     return parsed;
   } catch (e) {
-    await recordFailure(db, PROVIDER);
+    await noteProviderOutcome({
+      db: env.DB,
+      enabled,
+      provider: "kroger_products",
+      outcome: classifyError(e)
+    });
+    await recordFailure(env.DB, PROVIDER);
     throw e;
   }
 }

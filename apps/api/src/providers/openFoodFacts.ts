@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { isOpen, recordFailure, recordSuccess } from "../lib/circuitBreaker";
+import { fetchWithRetry, HttpError, RetryOptions, TimeoutError } from "../lib/http";
+import { noteProviderOutcome } from "../lib/providerMetrics";
 
 export const OFF_ATTRIBUTION = {
   text: "Data from Open Food Facts",
@@ -92,62 +94,101 @@ export function parseOffSearchResponse(json: unknown): {
   return { total, page, page_size, products };
 }
 
-function buildHeaders(env: { OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string }): Record<string, string> {
-  return {
+const PROVIDER = "openfoodfacts";
+const RETRY_OPTIONS: RetryOptions = {
+  attempts: 3,
+  baseDelayMs: 250,
+  maxDelayMs: 2000,
+  retryOnStatuses: [429, 500, 502, 503, 504]
+};
+
+type ProviderEnv = {
+  DB: D1Database;
+  OUTBOUND_USER_AGENT?: string;
+  OUTBOUND_REFERER?: string;
+  OFF_BASE_URL?: string;
+  METRICS_ENABLED?: string;
+  PROVIDER_TIMEOUT_MS?: string;
+};
+
+function getTimeoutMs(env: ProviderEnv) {
+  const parsed = Number(env.PROVIDER_TIMEOUT_MS ?? "6000");
+  return Number.isFinite(parsed) ? parsed : 6000;
+}
+
+function buildHeaders(env: ProviderEnv) {
+  const headers: Record<string, string> = {
     Accept: "application/json",
-    "User-Agent": env.OUTBOUND_USER_AGENT || "PriceCart/0.1 (contact: you@example.com)",
-    Referer: env.OUTBOUND_REFERER || "https://example.com"
+    "User-Agent": env.OUTBOUND_USER_AGENT || "PriceCart/0.1 (phase6)"
   };
-}
-
-async function fetchJson(url: string, headers: Record<string, string>, timeoutMs: number) {
-  const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { headers, signal: ctrl.signal });
-    return { res, json: await res.json().catch(() => null) };
-  } finally {
-    clearTimeout(id);
+  if (env.OUTBOUND_REFERER) {
+    headers.Referer = env.OUTBOUND_REFERER;
   }
+  return headers;
 }
 
-export async function offLookupByUpc(
-  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string; OFF_BASE_URL?: string },
-  upc: string
-): Promise<OffProductRaw> {
-  const provider = "openfoodfacts";
-  if (await isOpen(env.DB, provider)) throw new Error("PROVIDER_OPEN");
+function classifyError(err: unknown): string {
+  if (err instanceof TimeoutError) return "timeout";
+  if (err instanceof HttpError) {
+    if (err.status === 429) return "rate_limited";
+    if (err.status >= 500) return "http_5xx";
+    if (err.status >= 400) return "http_4xx";
+  }
+  if (err instanceof SyntaxError) return "parse_error";
+  return "other";
+}
 
-  const base = env.OFF_BASE_URL || "https://world.openfoodfacts.org";
+async function fetchJsonWithRetry(env: ProviderEnv, url: string) {
+  const timeoutMs = getTimeoutMs(env);
+  const res = await fetchWithRetry(
+    url,
+    {
+      method: "GET",
+      headers: buildHeaders(env)
+    },
+    { timeoutMs, retry: RETRY_OPTIONS }
+  );
+
+  if (!res.ok) {
+    throw new HttpError(`OFF_HTTP_${res.status}`, res.status, url);
+  }
+
+  return res.json();
+}
+
+export async function offLookupByUpc(env: ProviderEnv, upc: string): Promise<OffProductRaw> {
+  const provider = PROVIDER;
+  if (await isOpen(env.DB, provider)) throw new Error("PROVIDER_OPEN");
+  const enabled = env.METRICS_ENABLED === "1";
+
+  const base = (env.OFF_BASE_URL || "https://world.openfoodfacts.org").replace(/\/+$/, "");
   const url = new URL(`${base}/api/v2/product/${encodeURIComponent(upc)}.json`);
   url.searchParams.set("fields", "code,product_name,brands,quantity,image_front_url,url,last_modified_t");
 
   try {
-    const { res, json } = await fetchJson(url.toString(), buildHeaders(env), 8000);
-    if (!res.ok) {
-      await recordFailure(env.DB, provider);
-      throw new Error(`OFF_HTTP_${res.status}`);
-    }
-
+    const json = await fetchJsonWithRetry(env, url.toString());
     const product = parseOffLookupResponse(json, upc);
     await recordSuccess(env.DB, provider);
+    await noteProviderOutcome({ db: env.DB, enabled, provider, outcome: "success" });
     return product;
   } catch (e) {
+    await noteProviderOutcome({ db: env.DB, enabled, provider, outcome: classifyError(e) });
     await recordFailure(env.DB, provider);
     throw e;
   }
 }
 
 export async function offSearch(
-  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string; OFF_BASE_URL?: string },
+  env: ProviderEnv,
   q: string,
   page: number,
   pageSize: number
 ): Promise<{ total: number; page: number; page_size: number; products: OffProductRaw[] }> {
-  const provider = "openfoodfacts";
+  const provider = PROVIDER;
   if (await isOpen(env.DB, provider)) throw new Error("PROVIDER_OPEN");
+  const enabled = env.METRICS_ENABLED === "1";
 
-  const base = env.OFF_BASE_URL || "https://world.openfoodfacts.org";
+  const base = (env.OFF_BASE_URL || "https://world.openfoodfacts.org").replace(/\/+$/, "");
   const url = new URL(`${base}/api/v2/search`);
   url.searchParams.set("search_terms", q);
   url.searchParams.set("page", String(page));
@@ -155,16 +196,13 @@ export async function offSearch(
   url.searchParams.set("fields", "code,product_name,brands,quantity,image_front_url,url,last_modified_t");
 
   try {
-    const { res, json } = await fetchJson(url.toString(), buildHeaders(env), 9000);
-    if (!res.ok) {
-      await recordFailure(env.DB, provider);
-      throw new Error(`OFF_HTTP_${res.status}`);
-    }
-
+    const json = await fetchJsonWithRetry(env, url.toString());
     const parsed = parseOffSearchResponse(json);
     await recordSuccess(env.DB, provider);
+    await noteProviderOutcome({ db: env.DB, enabled, provider, outcome: "success" });
     return { total: parsed.total, page: parsed.page, page_size: parsed.page_size, products: parsed.products };
   } catch (e) {
+    await noteProviderOutcome({ db: env.DB, enabled, provider, outcome: classifyError(e) });
     await recordFailure(env.DB, provider);
     throw e;
   }

@@ -15,7 +15,13 @@ const RL_GEOCODE = { capacity: 10, refillPerSec: 1 / 10, cost: 1 };   // ~10/min
 const RL_OVERPASS = { capacity: 10, refillPerSec: 1 / 30, cost: 1 };  // ~10/5min max per session
 
 export async function storeSearch(
-  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string },
+  env: {
+    DB: D1Database;
+    OUTBOUND_USER_AGENT?: string;
+    OUTBOUND_REFERER?: string;
+    METRICS_ENABLED?: string;
+    PROVIDER_TIMEOUT_MS?: string;
+  },
   input: { location: string; radius_m: number; session_id: string }
 ): Promise<StoreSearchResponse> {
   const radius = Math.min(Math.max(input.radius_m, 250), 20000); // clamp 250m..20km
