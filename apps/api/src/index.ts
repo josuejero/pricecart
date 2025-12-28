@@ -1,10 +1,11 @@
-import { CartAddItemRequestSchema, CartSetItemRequestSchema } from "@pricecart/shared";
+import { CartAddItemRequestSchema, CartQuoteRequestSchema, CartSetItemRequestSchema, PriceSubmitRequestSchema } from "@pricecart/shared";
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./env";
 import { cors } from "./middleware/cors";
 import { securityHeaders } from "./middleware/security";
 import { addCartItem, clearCart, getCart, removeCartItem, setCartItemQuantity } from "./services/cart";
+import { quoteCart, submitPrice } from "./services/pricing";
 import { productSearch } from "./services/productSearch";
 import { storeSearch } from "./services/storeDiscovery";
 
@@ -245,6 +246,77 @@ app.post("/cart/clear", async (c) => {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
     if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+app.post("/cart/quote", async (c) => {
+  try {
+    const session_id = requireSession(c);
+    const body = await c.req.json();
+    const parsed = CartQuoteRequestSchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: "INVALID_INPUT" }, 400);
+
+    const res = await quoteCart(c.env, { session_id, store_ids: parsed.data.store_ids });
+
+    console.log(
+      JSON.stringify({
+        level: "info",
+        route: "/cart/quote",
+        session: session_id,
+        store_count: parsed.data.store_ids.length,
+        cheapest_store_id: res.cheapest_store_id,
+        warnings: res.warnings
+      })
+    );
+
+    return c.json(res);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
+    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+app.post("/prices/submit", async (c) => {
+  try {
+    const session_id = requireSession(c);
+    const body = await c.req.json();
+    const parsed = PriceSubmitRequestSchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: "INVALID_INPUT" }, 400);
+
+    const out = await submitPrice(c.env, {
+      session_id,
+      store_id: parsed.data.store_id,
+      upc: parsed.data.upc,
+      price_cents: parsed.data.price_cents,
+      currency: parsed.data.currency,
+      observed_at: parsed.data.observed_at,
+      evidence_type: parsed.data.evidence_type
+    });
+
+    console.log(
+      JSON.stringify({
+        level: "info",
+        route: "/prices/submit",
+        session: session_id,
+        store_id: parsed.data.store_id,
+        upc: parsed.data.upc,
+        price_cents: parsed.data.price_cents,
+        snapshot_id: out.snapshot_id
+      })
+    );
+
+    return c.json({ ok: true, snapshot_id: out.snapshot_id });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
+    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
+    if (msg === "STORE_NOT_FOUND") return c.json({ error: "STORE_NOT_FOUND" }, 404);
+    if (msg === "PRODUCT_NOT_FOUND") return c.json({ error: "PRODUCT_NOT_FOUND" }, 404);
+    if (msg === "OUTLIER_PRICE") return c.json({ error: "OUTLIER_PRICE" }, 422);
+    if (msg === "OBSERVED_AT_IN_FUTURE") return c.json({ error: "OBSERVED_AT_IN_FUTURE" }, 400);
     return c.json({ error: "INTERNAL_ERROR" }, 500);
   }
 });

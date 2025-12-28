@@ -1,7 +1,11 @@
 import type {
   Cart,
   CartAddItemRequest,
+  CartQuoteRequest,
+  CartQuoteResponse,
   CartSetItemRequest,
+  PriceSubmitRequest,
+  PriceSubmitResponse,
   ProductLookupResponse,
   ProductSearchResponse,
   StoreSearchResponse
@@ -90,4 +94,16 @@ export async function clearCart(): Promise<Cart> {
   const base = apiBase();
   const url = new URL(base + "/cart/clear");
   return fetchJson<Cart>(url.toString(), { method: "POST", json: {} });
+}
+
+export async function quoteCart(req: CartQuoteRequest): Promise<CartQuoteResponse> {
+  const base = apiBase();
+  const url = new URL(base + "/cart/quote");
+  return fetchJson<CartQuoteResponse>(url.toString(), { method: "POST", json: req });
+}
+
+export async function submitPrice(req: PriceSubmitRequest): Promise<PriceSubmitResponse> {
+  const base = apiBase();
+  const url = new URL(base + "/prices/submit");
+  return fetchJson<PriceSubmitResponse>(url.toString(), { method: "POST", json: req });
 }

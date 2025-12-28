@@ -47,6 +47,7 @@ apps/
       0002_phase1_seed_stores.sql
       0003_phase2_product_identity.sql
       0004_phase2_seed_products.sql
+      0005_phase3_cart.sql
     src/
       lib/
         cache.ts
@@ -70,6 +71,7 @@ apps/
         openFoodFacts.ts
         overpass.ts
       services/
+        cart.ts
         productCatalog.ts
         productSearch.ts
         storeDiscovery.ts
@@ -100,6 +102,9 @@ apps/
     src/
       lib/
         api.ts
+        cart.ts
+        cartReducer.test.ts
+        cartReducer.ts
         session.ts
       App.css
       App.tsx
@@ -118,6 +123,7 @@ apps/
 packages/
   shared/
     src/
+      cart.ts
       index.ts
       product.ts
       store.ts
@@ -217,31 +223,26 @@ CREATE TABLE IF NOT EXISTS product_provider_payloads (
 );
 </file>
 
-<file path="apps/api/migrations/0004_phase2_seed_products.sql">
-INSERT OR REPLACE INTO seed_meta (k, v) VALUES ('seed_products_version', 'phase2-v1');
+<file path="apps/api/migrations/0005_phase3_cart.sql">
+-- Phase 3: server-backed cart (anonymous session)
 
-INSERT OR REPLACE INTO products (
-  upc, source, off_product_id, name, brand, quantity_value, quantity_unit,
-  normalized_name, image_url, source_url, updated_at, raw_hash
-) VALUES
-(
-  '0000000000001', 'seed', NULL,
-  'Seed Whole Milk', 'Seed Brand',
-  1.0, 'l',
-  'seed brand seed whole milk',
-  NULL, NULL,
-  strftime('%s','now'),
-  NULL
-),
-(
-  '0000000000002', 'seed', NULL,
-  'Seed Peanut Butter', 'Seed Brand',
-  16.0, 'oz',
-  'seed brand seed peanut butter',
-  NULL, NULL,
-  strftime('%s','now'),
-  NULL
+CREATE TABLE IF NOT EXISTS carts (
+  session_id TEXT PRIMARY KEY,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS cart_items (
+  session_id TEXT NOT NULL,
+  upc TEXT NOT NULL,
+  quantity INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (session_id, upc)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cart_items_session
+  ON cart_items(session_id);
 </file>
 
 <file path="apps/api/src/lib/cache.ts">
@@ -463,28 +464,6 @@ export async function takeToken(
 
 <file path="apps/api/src/lib/time.ts">
 export const nowSec = () => Math.floor(Date.now() / 1000);
-</file>
-
-<file path="apps/api/src/middleware/cors.ts">
-import type { MiddlewareHandler } from "hono";
-
-export function cors(allowedOrigin: string): MiddlewareHandler {
-  return async (c, next) => {
-    const origin = c.req.header("Origin") || "";
-    if (origin && origin === allowedOrigin) {
-      c.header("Access-Control-Allow-Origin", origin);
-      c.header("Vary", "Origin");
-      c.header("Access-Control-Allow-Headers", "content-type, x-pricecart-session");
-      c.header("Access-Control-Allow-Methods", "GET, OPTIONS");
-    }
-
-    if (c.req.method === "OPTIONS") {
-      return c.body(null, 204);
-    }
-
-    await next();
-  };
-}
 </file>
 
 <file path="apps/api/src/middleware/security.ts">
@@ -886,6 +865,197 @@ out body;
     await recordFailure(env.DB, provider);
     throw e;
   }
+}
+</file>
+
+<file path="apps/api/src/services/cart.ts">
+import type { Cart, CartLine } from "@pricecart/shared";
+import { takeToken } from "../lib/rateLimit";
+import { nowSec } from "../lib/time";
+
+const CART_MAX_ITEMS = 100;
+const CART_MAX_QTY = 99;
+
+// Write budgets (per session) - demo-friendly and abuse-resistant
+const RL_CART_WRITE = { capacity: 30, refillPerSec: 1 / 2, cost: 1 }; // ~30/min
+
+type EnvLike = { DB: D1Database };
+
+type ProductJoinRow = {
+  upc: string;
+  quantity: number;
+  name: string | null;
+  brand: string | null;
+  quantity_value: number | null;
+  quantity_unit: string | null;
+  image_url: string | null;
+  updated_at: number;
+};
+
+function toCartLine(r: ProductJoinRow): CartLine {
+  return {
+    upc: r.upc,
+    name: r.name ?? "Unknown product",
+    brand: r.brand ?? null,
+    quantity: { raw: null, value: r.quantity_value ?? null, unit: r.quantity_unit ?? null },
+    image_url: r.image_url ?? null,
+    count: r.quantity
+  };
+}
+
+async function ensureCart(env: EnvLike, session_id: string): Promise<void> {
+  const t = nowSec();
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO carts (session_id, created_at, updated_at) VALUES (?, ?, ?)"
+  )
+    .bind(session_id, t, t)
+    .run();
+}
+
+async function touchCart(env: EnvLike, session_id: string): Promise<void> {
+  const t = nowSec();
+  await env.DB.prepare("UPDATE carts SET updated_at = ? WHERE session_id = ?")
+    .bind(t, session_id)
+    .run();
+}
+
+export async function getCart(env: EnvLike, session_id: string): Promise<Cart> {
+  await ensureCart(env, session_id);
+
+  const rows = await env.DB.prepare(
+    `SELECT
+      ci.upc as upc,
+      ci.quantity as quantity,
+      p.name as name,
+      p.brand as brand,
+      p.quantity_value as quantity_value,
+      p.quantity_unit as quantity_unit,
+      p.image_url as image_url,
+      ci.updated_at as updated_at
+     FROM cart_items ci
+     LEFT JOIN products p ON p.upc = ci.upc
+     WHERE ci.session_id = ?
+     ORDER BY ci.updated_at DESC`
+  )
+    .bind(session_id)
+    .all<ProductJoinRow>();
+
+  const items = rows.results.map(toCartLine);
+  const item_count = items.length;
+  const total_units = items.reduce((sum, it) => sum + it.count, 0);
+
+  const meta = await env.DB.prepare("SELECT updated_at FROM carts WHERE session_id = ?")
+    .bind(session_id)
+    .first<{ updated_at: number }>();
+
+  return {
+    session_id,
+    updated_at: meta?.updated_at ?? nowSec(),
+    item_count,
+    total_units,
+    items
+  };
+}
+
+export async function addCartItem(
+  env: EnvLike,
+  input: { session_id: string; upc: string; quantity: number }
+): Promise<Cart> {
+  await ensureCart(env, input.session_id);
+
+  const ok = await takeToken(env.DB, `cart_write:${input.session_id}`, RL_CART_WRITE);
+  if (!ok) throw new Error("RATE_LIMITED");
+
+  if (input.quantity > CART_MAX_QTY) throw new Error("QUANTITY_TOO_LARGE");
+
+  // Ensure product exists (cart is built from resolved products)
+  const prod = await env.DB.prepare("SELECT upc FROM products WHERE upc = ?")
+    .bind(input.upc)
+    .first<{ upc: string }>();
+  if (!prod) throw new Error("PRODUCT_NOT_FOUND");
+
+  const t = nowSec();
+  const existing = await env.DB.prepare(
+    "SELECT quantity FROM cart_items WHERE session_id = ? AND upc = ?"
+  )
+    .bind(input.session_id, input.upc)
+    .first<{ quantity: number }>();
+
+  const isNew = !existing;
+
+  if (isNew) {
+    const cnt = await env.DB.prepare(
+      "SELECT COUNT(1) as n FROM cart_items WHERE session_id = ?"
+    )
+      .bind(input.session_id)
+      .first<{ n: number }>();
+
+    if ((cnt?.n ?? 0) >= CART_MAX_ITEMS) throw new Error("CART_TOO_LARGE");
+  }
+
+  const nextQty = Math.min(CART_MAX_QTY, (existing?.quantity ?? 0) + input.quantity);
+
+  await env.DB.prepare(
+    "INSERT OR REPLACE INTO cart_items (session_id, upc, quantity, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+  )
+    .bind(input.session_id, input.upc, nextQty, existing ? t : t, t)
+    .run();
+
+  await touchCart(env, input.session_id);
+  return getCart(env, input.session_id);
+}
+
+export async function setCartItemQuantity(
+  env: EnvLike,
+  input: { session_id: string; upc: string; quantity: number }
+): Promise<Cart> {
+  await ensureCart(env, input.session_id);
+
+  const ok = await takeToken(env.DB, `cart_write:${input.session_id}`, RL_CART_WRITE);
+  if (!ok) throw new Error("RATE_LIMITED");
+
+  if (input.quantity > CART_MAX_QTY) throw new Error("QUANTITY_TOO_LARGE");
+
+  const t = nowSec();
+  await env.DB.prepare(
+    "UPDATE cart_items SET quantity = ?, updated_at = ? WHERE session_id = ? AND upc = ?"
+  )
+    .bind(input.quantity, t, input.session_id, input.upc)
+    .run();
+
+  await touchCart(env, input.session_id);
+  return getCart(env, input.session_id);
+}
+
+export async function removeCartItem(
+  env: EnvLike,
+  input: { session_id: string; upc: string }
+): Promise<Cart> {
+  await ensureCart(env, input.session_id);
+
+  const ok = await takeToken(env.DB, `cart_write:${input.session_id}`, RL_CART_WRITE);
+  if (!ok) throw new Error("RATE_LIMITED");
+
+  await env.DB.prepare("DELETE FROM cart_items WHERE session_id = ? AND upc = ?")
+    .bind(input.session_id, input.upc)
+    .run();
+
+  await touchCart(env, input.session_id);
+  return getCart(env, input.session_id);
+}
+
+export async function clearCart(env: EnvLike, session_id: string): Promise<Cart> {
+  await ensureCart(env, session_id);
+
+  const ok = await takeToken(env.DB, `cart_write:${session_id}`, RL_CART_WRITE);
+  if (!ok) throw new Error("RATE_LIMITED");
+
+  await env.DB.prepare("DELETE FROM cart_items WHERE session_id = ?")
+    .bind(session_id)
+    .run();
+
+  await touchCart(env, session_id);
+  return getCart(env, session_id);
 }
 </file>
 
@@ -1653,169 +1823,6 @@ button:focus-visible {
 }
 </file>
 
-<file path="apps/api/src/index.ts">
-import { Hono } from "hono";
-import { z } from "zod";
-import type { Env } from "./env";
-import { cors } from "./middleware/cors";
-import { securityHeaders } from "./middleware/security";
-import { productSearch } from "./services/productSearch";
-import { storeSearch } from "./services/storeDiscovery";
-
-const app = new Hono<{ Bindings: Env }>();
-
-// Adjust to your Pages domain once known
-const ALLOWED_ORIGIN = "http://localhost:5173";
-
-app.use("*", securityHeaders());
-app.use("*", cors(ALLOWED_ORIGIN));
-
-app.get("/health", (c) => c.json({ ok: true }));
-
-const StoreSearchQuery = z.object({
-  location: z.string().min(2).max(200),
-  radius_m: z.coerce.number().int().positive().optional(),
-  page: z.coerce.number().int().min(1).optional(),
-  page_size: z.coerce.number().int().min(1).max(50).optional()
-});
-
-const ProductSearchQuery = z.object({
-  q: z.string().min(2).max(200),
-  page: z.coerce.number().int().min(1).optional(),
-  page_size: z.coerce.number().int().min(1).max(50).optional()
-});
-
-function slicePage<T>(items: T[], page: number, pageSize: number): T[] {
-  const start = (page - 1) * pageSize;
-  return items.slice(start, start + pageSize);
-}
-
-app.get("/stores/search", async (c) => {
-  const parsed = StoreSearchQuery.safeParse({
-    location: c.req.query("location"),
-    radius_m: c.req.query("radius_m"),
-    page: c.req.query("page"),
-    page_size: c.req.query("page_size")
-  });
-
-  if (!parsed.success) {
-    return c.json({ error: "INVALID_INPUT", details: parsed.error.flatten() }, 400);
-  }
-
-  const sessionId = c.req.header("x-pricecart-session") || "anon";
-  const page = parsed.data.page ?? 1;
-  const pageSize = parsed.data.page_size ?? 20;
-
-  try {
-    const res = await storeSearch(c.env, {
-      location: parsed.data.location,
-      radius_m: parsed.data.radius_m ?? 5000,
-      session_id: sessionId
-    });
-
-    const totalCount = res.stores.length;
-    const stores = slicePage(res.stores, page, pageSize);
-
-    console.log(
-      JSON.stringify({
-        level: "info",
-        route: "/stores/search",
-        session: sessionId,
-        data_mode: res.data_mode,
-        radius_m: res.radius_m,
-        page,
-        page_size: pageSize,
-        store_count: stores.length,
-        total_count: totalCount
-      })
-    );
-
-    return c.json({
-      ...res,
-      stores,
-      page,
-      page_size: pageSize,
-      total_count: totalCount
-    });
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-
-    if (msg.includes("RATE_LIMIT")) return c.json({ error: "RATE_LIMITED" }, 429);
-    if (msg.includes("NOT_FOUND")) return c.json({ error: "NOT_FOUND" }, 404);
-
-    console.log(
-      JSON.stringify({
-        level: "error",
-        route: "/stores/search",
-        session: sessionId,
-        message: "store search failed",
-        err: msg
-      })
-    );
-
-    return c.json({ error: "INTERNAL_ERROR" }, 500);
-  }
-});
-
-app.get("/products/search", async (c) => {
-  const parsed = ProductSearchQuery.safeParse({
-    q: c.req.query("q"),
-    page: c.req.query("page"),
-    page_size: c.req.query("page_size")
-  });
-
-  if (!parsed.success) {
-    return c.json({ error: "INVALID_INPUT", details: parsed.error.flatten() }, 400);
-  }
-
-  const sessionId = c.req.header("x-pricecart-session") || "anon";
-  const page = parsed.data.page ?? 1;
-  const pageSize = parsed.data.page_size ?? 10;
-
-  try {
-    const res = await productSearch(c.env, {
-      q: parsed.data.q,
-      page,
-      page_size: pageSize,
-      session_id: sessionId
-    });
-
-    console.log(
-      JSON.stringify({
-        level: "info",
-        route: "/products/search",
-        session: sessionId,
-        q: parsed.data.q,
-        page,
-        page_size: pageSize,
-        product_count: res.products.length,
-        total_count: res.total_count
-      })
-    );
-
-    return c.json(res);
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-
-    if (msg.includes("RATE_LIMIT")) return c.json({ error: "RATE_LIMITED" }, 429);
-
-    console.log(
-      JSON.stringify({
-        level: "error",
-        route: "/products/search",
-        session: sessionId,
-        message: "product search failed",
-        err: msg
-      })
-    );
-
-    return c.json({ error: "INTERNAL_ERROR" }, 500);
-  }
-});
-
-export default app;
-</file>
-
 <file path="apps/api/src/main.tsx">
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
@@ -2120,22 +2127,6 @@ export default tseslint.config([
 }
 </file>
 
-<file path="apps/api/vite.config.ts">
-import { cloudflare } from "@cloudflare/vite-plugin";
-import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
-
-// https://vite.dev/config/
-export default defineConfig(({ mode }) => {
-  // Vitest runs Vite in "test" mode and sets VITEST in the config process env.
-  const isVitest = !!process.env.VITEST || mode === "test";
-
-  return {
-    plugins: isVitest ? [react()] : [react(), cloudflare()],
-  };
-});
-</file>
-
 <file path="apps/api/wrangler.jsonc">
 /**
  * For more details on how to configure Wrangler, refer to:
@@ -2195,46 +2186,137 @@ database_name = "pricecart"
 database_id = "f0f7e12d-54da-4aa0-a94e-d84a80a71169"
 </file>
 
-<file path="apps/web/src/lib/api.ts">
-import type { ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
-import { getSessionId } from "./session";
+<file path="apps/web/src/lib/cart.ts">
+import type { Cart } from "@pricecart/shared";
+import { CartSchema } from "@pricecart/shared";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { addCartItem, clearCart, getCart, removeCartItem, setCartItem } from "./api";
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, {
-    headers: {
-      "x-pricecart-session": getSessionId()
-    }
+const STORAGE_KEY = "pricecart_cart_v1";
+
+function loadLocalCart(): Cart | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = CartSchema.safeParse(JSON.parse(raw));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveLocalCart(cart: Cart) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(cart));
+}
+
+export type CartState = {
+  cart: Cart | null;
+  status: "idle" | "loading" | "ready" | "error";
+  error: string | null;
+};
+
+export function useCart() {
+  const [state, setState] = useState<CartState>(() => {
+    const local = loadLocalCart();
+    return { cart: local, status: local ? "ready" : "idle", error: null };
   });
 
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body?.error || `HTTP_${res.status}`);
+  const refresh = useCallback(async () => {
+    setState((s) => ({ ...s, status: "loading", error: null }));
+    try {
+      const c = await getCart();
+      saveLocalCart(c);
+      setState({ cart: c, status: "ready", error: null });
+    } catch (e) {
+      setState((s) => ({ ...s, status: "error", error: e instanceof Error ? e.message : String(e) }));
+    }
+  }, []);
+
+  useEffect(() => {
+    // Always reconcile with the backend on mount
+    void refresh();
+  }, [refresh]);
+
+  const actions = useMemo(() => {
+    return {
+      async add(upc: string, quantity: number = 1) {
+        setState((s) => ({ ...s, status: "loading", error: null }));
+        try {
+          const c = await addCartItem({ upc, quantity });
+          saveLocalCart(c);
+          setState({ cart: c, status: "ready", error: null });
+        } catch (e) {
+          setState((s) => ({ ...s, status: "error", error: e instanceof Error ? e.message : String(e) }));
+        }
+      },
+      async setQuantity(upc: string, quantity: number) {
+        setState((s) => ({ ...s, status: "loading", error: null }));
+        try {
+          const c = await setCartItem(upc, { quantity });
+          saveLocalCart(c);
+          setState({ cart: c, status: "ready", error: null });
+        } catch (e) {
+          setState((s) => ({ ...s, status: "error", error: e instanceof Error ? e.message : String(e) }));
+        }
+      },
+      async remove(upc: string) {
+        setState((s) => ({ ...s, status: "loading", error: null }));
+        try {
+          const c = await removeCartItem(upc);
+          saveLocalCart(c);
+          setState({ cart: c, status: "ready", error: null });
+        } catch (e) {
+          setState((s) => ({ ...s, status: "error", error: e instanceof Error ? e.message : String(e) }));
+        }
+      },
+      async clear() {
+        setState((s) => ({ ...s, status: "loading", error: null }));
+        try {
+          const c = await clearCart();
+          saveLocalCart(c);
+          setState({ cart: c, status: "ready", error: null });
+        } catch (e) {
+          setState((s) => ({ ...s, status: "error", error: e instanceof Error ? e.message : String(e) }));
+        }
+      },
+      refresh
+    };
+  }, [refresh]);
+
+  return { ...state, ...actions };
+}
+</file>
+
+<file path="apps/web/src/lib/cartReducer.test.ts">
+import { describe, expect, it } from "vitest";
+import { normalizeCart } from "./cartReducer";
+
+describe("normalizeCart", () => {
+  it("merges duplicate UPCs", () => {
+    const out = normalizeCart({ items: [{ upc: "1", count: 1 }, { upc: "1", count: 2 }] });
+    expect(out.items).toEqual([{ upc: "1", count: 3 }]);
+  });
+
+  it("clamps minimum quantity to 1", () => {
+    const out = normalizeCart({ items: [{ upc: "1", count: 0 }] });
+    expect(out.items[0].count).toBe(1);
+  });
+});
+</file>
+
+<file path="apps/web/src/lib/cartReducer.ts">
+export type CartItem = { upc: string; count: number };
+export type CartModel = { items: CartItem[] };
+
+export const CART_MAX_QTY = 99;
+
+export function normalizeCart(model: CartModel): CartModel {
+  const m = new Map<string, number>();
+  for (const it of model.items) {
+    const next = (m.get(it.upc) ?? 0) + it.count;
+    m.set(it.upc, Math.min(CART_MAX_QTY, Math.max(1, next)));
   }
-
-  return (await res.json()) as T;
-}
-
-export async function fetchStores(params: { location: string; radius_m: number }): Promise<StoreSearchResponse> {
-  const base = import.meta.env.VITE_API_BASE_URL;
-  const url = new URL(base + "/stores/search");
-  url.searchParams.set("location", params.location);
-  url.searchParams.set("radius_m", String(params.radius_m));
-  return fetchJson<StoreSearchResponse>(url.toString());
-}
-
-export async function lookupProductByUpc(upc: string): Promise<ProductLookupResponse> {
-  const base = import.meta.env.VITE_API_BASE_URL;
-  const url = new URL(base + `/products/lookup/${encodeURIComponent(upc)}`);
-  return fetchJson<ProductLookupResponse>(url.toString());
-}
-
-export async function searchProducts(params: { q: string; page?: number; page_size?: number }): Promise<ProductSearchResponse> {
-  const base = import.meta.env.VITE_API_BASE_URL;
-  const url = new URL(base + "/products/search");
-  url.searchParams.set("q", params.q);
-  url.searchParams.set("page", String(params.page ?? 1));
-  url.searchParams.set("page_size", String(params.page_size ?? 10));
-  return fetchJson<ProductSearchResponse>(url.toString());
+  return { items: Array.from(m.entries()).map(([upc, count]) => ({ upc, count })) };
 }
 </file>
 
@@ -2291,300 +2373,6 @@ export function getSessionId(): string {
 
 .read-the-docs {
   color: #888;
-}
-</file>
-
-<file path="apps/web/src/App.tsx">
-import type { Product, ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
-import "leaflet/dist/leaflet.css";
-import { useMemo, useState } from "react";
-import { MapContainer, Marker, Popup, TileLayer } from "react-leaflet";
-import { fetchStores, lookupProductByUpc, searchProducts } from "./lib/api";
-
-function formatErrorMessage(err: unknown) {
-  return err instanceof Error ? err.message : String(err);
-}
-
-export default function App() {
-  const [view, setView] = useState<"stores" | "products">("stores");
-
-  // Phase 1: Stores
-  const [location, setLocation] = useState("10001");
-  const [radius, setRadius] = useState(1500);
-  const [storesData, setStoresData] = useState<StoreSearchResponse | null>(null);
-  const [status, setStatus] = useState<string>("");
-
-  const center = useMemo(() => {
-    if (!storesData) return { lat: 40.7484, lon: -73.9857 };
-    return storesData.center;
-  }, [storesData]);
-
-  async function onStoreSearch() {
-    setStatus("Searching...");
-    try {
-      const res = await fetchStores({ location, radius_m: radius });
-      setStoresData(res);
-      setStatus(res.data_mode === "live" ? "" : `Using ${res.data_mode} data`);
-    } catch (e: unknown) {
-      setStatus(`Error: ${formatErrorMessage(e)}`);
-    }
-  }
-
-  // Phase 2: Products
-  const [upc, setUpc] = useState("");
-  const [lookup, setLookup] = useState<ProductLookupResponse | null>(null);
-  const [q, setQ] = useState("");
-  const [search, setSearch] = useState<ProductSearchResponse | null>(null);
-  const [pStatus, setPStatus] = useState<string>("");
-
-  type CartItem = { upc: string; name: string; brand: string | null; quantityLabel: string; count: number };
-  const [cart, setCart] = useState<CartItem[]>([]);
-
-  function addToCart(p: Product) {
-    const label = p.quantity?.raw || (p.quantity?.value && p.quantity?.unit ? `${p.quantity.value} ${p.quantity.unit}` : "");
-
-    setCart((prev) => {
-      const ix = prev.findIndex((x) => x.upc === p.upc);
-      if (ix >= 0) {
-        const copy = [...prev];
-        copy[ix] = { ...copy[ix], count: copy[ix].count + 1 };
-        return copy;
-      }
-      return [...prev, { upc: p.upc, name: p.name, brand: p.brand ?? null, quantityLabel: label, count: 1 }];
-    });
-  }
-
-  function removeFromCart(upc: string) {
-    setCart((prev) => prev.filter((x) => x.upc !== upc));
-  }
-
-  async function onLookup() {
-    setPStatus("Looking up...");
-    setLookup(null);
-    try {
-      const res = await lookupProductByUpc(upc);
-      setLookup(res);
-      setPStatus(res.data_mode === "live" ? "" : `Using ${res.data_mode}${res.cache_state ? ` (${res.cache_state})` : ""}`);
-    } catch (e: unknown) {
-      setPStatus(`Error: ${formatErrorMessage(e)}`);
-    }
-  }
-
-  async function onSearchProducts() {
-    setPStatus("Searching products...");
-    setSearch(null);
-    try {
-      const res = await searchProducts({ q, page: 1, page_size: 10 });
-      setSearch(res);
-      setPStatus(res.data_mode === "live" ? "" : `Using ${res.data_mode}${res.cache_state ? ` (${res.cache_state})` : ""}`);
-    } catch (e: unknown) {
-      setPStatus(`Error: ${formatErrorMessage(e)}`);
-    }
-  }
-
-  return (
-    <div style={{ display: "grid", gridTemplateColumns: "420px 1fr", height: "100vh" }}>
-      <div style={{ padding: 16, overflow: "auto", borderRight: "1px solid #eee" }}>
-        <h1 style={{ marginTop: 0 }}>PriceCart</h1>
-        <p style={{ marginTop: 0, opacity: 0.8 }}>Phase 1: Stores • Phase 2: Product identity</p>
-
-        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-          <button onClick={() => setView("stores")} style={{ padding: "8px 12px", opacity: view === "stores" ? 1 : 0.6 }}>
-            Stores
-          </button>
-          <button onClick={() => setView("products")} style={{ padding: "8px 12px", opacity: view === "products" ? 1 : 0.6 }}>
-            Products
-          </button>
-        </div>
-
-        {view === "stores" ? (
-          <>
-            <h2 style={{ marginTop: 8 }}>Stores</h2>
-
-            <label style={{ display: "block", fontWeight: 600 }}>ZIP / Address</label>
-            <input
-              value={location}
-              onChange={(e) => setLocation(e.target.value)}
-              style={{ width: "100%", padding: 8, margin: "8px 0" }}
-              placeholder="10001"
-            />
-
-            <label style={{ display: "block", fontWeight: 600 }}>Radius (meters)</label>
-            <input
-              type="number"
-              value={radius}
-              onChange={(e) => setRadius(Number(e.target.value))}
-              style={{ width: "100%", padding: 8, margin: "8px 0" }}
-              min={250}
-              max={20000}
-            />
-
-            <button onClick={onStoreSearch} style={{ padding: "8px 12px" }}>
-              Search stores
-            </button>
-
-            {status && <p style={{ marginTop: 12, padding: 10, background: "#f7f7f7" }}>{status}</p>}
-
-            {storesData?.stores?.length ? (
-              <>
-                <h3>Results</h3>
-                <ol>
-                  {storesData.stores.map((s) => (
-                    <li key={s.id}>
-                      <div style={{ fontWeight: 600 }}>{s.name}</div>
-                      <div style={{ opacity: 0.8 }}>{Math.round(s.distance_m)} m</div>
-                    </li>
-                  ))}
-                </ol>
-
-                {storesData.data_mode !== "live" ? (
-                  <p style={{ fontSize: 12, opacity: 0.75 }}>
-                    Live providers may be rate limited or temporarily unavailable. This view is still valid for demos.
-                  </p>
-                ) : null}
-
-                <footer style={{ marginTop: 16, fontSize: 12, opacity: 0.8 }}>
-                  <div>{storesData.attribution.text}</div>
-                  <div>
-                    {storesData.attribution.links.map((l) => (
-                      <a key={l.href} href={l.href} target="_blank" rel="noreferrer" style={{ marginRight: 8 }}>
-                        {l.label}
-                      </a>
-                    ))}
-                  </div>
-                </footer>
-              </>
-            ) : null}
-          </>
-        ) : (
-          <>
-            <h2 style={{ marginTop: 8 }}>Products</h2>
-
-            <h3>UPC lookup</h3>
-            <label style={{ display: "block", fontWeight: 600 }}>UPC (8–14 digits)</label>
-            <input
-              value={upc}
-              onChange={(e) => setUpc(e.target.value)}
-              style={{ width: "100%", padding: 8, margin: "8px 0" }}
-              placeholder="0123456789012"
-            />
-            <button onClick={onLookup} style={{ padding: "8px 12px" }}>
-              Lookup
-            </button>
-
-            <h3 style={{ marginTop: 16 }}>Text search</h3>
-            <label style={{ display: "block", fontWeight: 600 }}>Search</label>
-            <input
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              style={{ width: "100%", padding: 8, margin: "8px 0" }}
-              placeholder="milk"
-            />
-            <button onClick={onSearchProducts} style={{ padding: "8px 12px" }}>
-              Search
-            </button>
-
-            {pStatus && <p style={{ marginTop: 12, padding: 10, background: "#f7f7f7" }}>{pStatus}</p>}
-
-            {lookup?.product ? (
-              <>
-                <h3 style={{ marginTop: 16 }}>Lookup result</h3>
-                <div style={{ padding: 12, border: "1px solid #eee", borderRadius: 8 }}>
-                  <div style={{ display: "flex", gap: 12 }}>
-                    {lookup.product.image_url ? (
-                      <img src={lookup.product.image_url} alt="" style={{ width: 72, height: 72, objectFit: "cover" }} />
-                    ) : null}
-                    <div>
-                      <div style={{ fontWeight: 700 }}>{lookup.product.name}</div>
-                      <div style={{ opacity: 0.8 }}>{lookup.product.brand ?? ""}</div>
-                      <div style={{ fontSize: 12, opacity: 0.8 }}>UPC: {lookup.product.upc}</div>
-                    </div>
-                  </div>
-
-                  <button onClick={() => addToCart(lookup.product)} style={{ marginTop: 12, padding: "8px 12px" }}>
-                    Add to cart
-                  </button>
-
-                  <div style={{ marginTop: 12, fontSize: 12, opacity: 0.8 }}>
-                    <div>{lookup.attribution.text}</div>
-                    <div>
-                      {lookup.attribution.links.map((l) => (
-                        <a key={l.href} href={l.href} target="_blank" rel="noreferrer" style={{ marginRight: 8 }}>
-                          {l.label}
-                        </a>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </>
-            ) : null}
-
-            {search?.products?.length ? (
-              <>
-                <h3 style={{ marginTop: 16 }}>Search results</h3>
-                <ul style={{ paddingLeft: 18 }}>
-                  {search.products.map((p) => (
-                    <li key={p.upc} style={{ marginBottom: 8 }}>
-                      <div style={{ fontWeight: 600 }}>{p.name}</div>
-                      <div style={{ fontSize: 12, opacity: 0.8 }}>{p.brand ?? ""} • {p.upc}</div>
-                      <button onClick={() => addToCart(p)} style={{ marginTop: 6, padding: "6px 10px" }}>
-                        Add
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-
-                <div style={{ marginTop: 12, fontSize: 12, opacity: 0.8 }}>
-                  <div>{search.attribution.text}</div>
-                  <div>
-                    {search.attribution.links.map((l) => (
-                      <a key={l.href} href={l.href} target="_blank" rel="noreferrer" style={{ marginRight: 8 }}>
-                        {l.label}
-                      </a>
-                    ))}
-                  </div>
-                </div>
-              </>
-            ) : null}
-
-            <h3 style={{ marginTop: 16 }}>Cart (local)</h3>
-            {cart.length ? (
-              <ul style={{ paddingLeft: 18 }}>
-                {cart.map((x) => (
-                  <li key={x.upc} style={{ marginBottom: 8 }}>
-                    <div style={{ fontWeight: 600 }}>
-                      {x.name} {x.count > 1 ? `×${x.count}` : ""}
-                    </div>
-                    <div style={{ fontSize: 12, opacity: 0.8 }}>{x.brand ?? ""} • {x.upc} {x.quantityLabel ? `• ${x.quantityLabel}` : ""}</div>
-                    <button onClick={() => removeFromCart(x.upc)} style={{ marginTop: 6, padding: "6px 10px" }}>
-                      Remove
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p style={{ opacity: 0.8 }}>Cart is empty.</p>
-            )}
-          </>
-        )}
-      </div>
-
-      <div style={{ height: "100%" }}>
-        <MapContainer center={[center.lat, center.lon]} zoom={13} style={{ height: "100%", width: "100%" }}>
-          <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="&copy; OpenStreetMap contributors" />
-          {storesData?.stores?.map((s) => (
-            <Marker key={s.id} position={[s.lat, s.lon]}>
-              <Popup>
-                <strong>{s.name}</strong>
-                <br />
-                {Math.round(s.distance_m)} m
-              </Popup>
-            </Marker>
-          ))}
-        </MapContainer>
-      </div>
-    </div>
-  );
 }
 </file>
 
@@ -2674,10 +2462,6 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
 );
 </file>
 
-<file path="apps/web/.env.example">
-VITE_API_BASE_URL=http://localhost:8787
-</file>
-
 <file path="apps/web/.gitignore">
 # Logs
 logs
@@ -2745,43 +2529,6 @@ export default defineConfig([
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-</file>
-
-<file path="apps/web/package.json">
-{
-  "name": "web",
-  "private": true,
-  "version": "0.0.0",
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
-    "lint": "eslint .",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "@pricecart/shared": "file:../../packages/shared",
-    "leaflet": "1.9.4",
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "react-leaflet": "5.0.0"
-  },
-  "devDependencies": {
-    "@eslint/js": "^9.39.1",
-    "@types/leaflet": "1.9.21",
-    "@types/node": "^24.10.1",
-    "@types/react": "^19.2.5",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^5.1.1",
-    "eslint": "^9.39.1",
-    "eslint-plugin-react-hooks": "^7.0.1",
-    "eslint-plugin-react-refresh": "^0.4.24",
-    "globals": "^16.5.0",
-    "typescript": "~5.9.3",
-    "typescript-eslint": "^8.46.4",
-    "vite": "^7.2.4"
-  }
-}
 </file>
 
 <file path="apps/web/README.md">
@@ -2940,9 +2687,39 @@ export default defineConfig({
 })
 </file>
 
-<file path="packages/shared/src/index.ts">
-export * from "./product";
-export * from "./store";
+<file path="packages/shared/src/cart.ts">
+import { z } from "zod";
+import { QuantitySchema } from "./product.js";
+
+export const CartLineSchema = z.object({
+  upc: z.string(),
+  name: z.string(),
+  brand: z.string().nullable().default(null),
+  quantity: QuantitySchema,
+  image_url: z.string().url().nullable().default(null),
+  count: z.number().int().positive()
+});
+export type CartLine = z.infer<typeof CartLineSchema>;
+
+export const CartSchema = z.object({
+  session_id: z.string(),
+  updated_at: z.number().int().nonnegative(),
+  item_count: z.number().int().nonnegative(),
+  total_units: z.number().int().nonnegative(),
+  items: z.array(CartLineSchema)
+});
+export type Cart = z.infer<typeof CartSchema>;
+
+export const CartAddItemRequestSchema = z.object({
+  upc: z.string(),
+  quantity: z.number().int().positive()
+});
+export type CartAddItemRequest = z.infer<typeof CartAddItemRequestSchema>;
+
+export const CartSetItemRequestSchema = z.object({
+  quantity: z.number().int().positive()
+});
+export type CartSetItemRequest = z.infer<typeof CartSetItemRequestSchema>;
 </file>
 
 <file path="packages/shared/src/product.ts">
@@ -3189,6 +2966,772 @@ apps/api/worker-configuration.d.ts
 packages/shared/dist/
 </file>
 
+<file path="apps/api/migrations/0004_phase2_seed_products.sql">
+INSERT OR REPLACE INTO seed_meta (k, v) VALUES ('seed_products_version', 'phase2-v1');
+
+INSERT OR REPLACE INTO products (
+  upc, source, off_product_id, name, brand, quantity_value, quantity_unit,
+  normalized_name, image_url, source_url, updated_at, raw_hash
+) VALUES
+(
+  '0000000000001', 'seed', NULL,
+  'Seed Whole Milk', 'Seed Brand',
+  1.0, 'l',
+  'seed brand seed whole milk',
+  NULL, NULL,
+  strftime('%s','now'),
+  NULL
+),
+(
+  '0000000000002', 'seed', NULL,
+  'Seed Peanut Butter', 'Seed Brand',
+  16.0, 'oz',
+  'seed brand seed peanut butter',
+  NULL, NULL,
+  strftime('%s','now'),
+  NULL
+),
+(
+  '012345678905', 'seed', NULL,
+  'Seed Honeycrisp Apples', 'Seed Brand',
+  3.0, 'lb',
+  'seed brand seed honeycrisp apples',
+  NULL, NULL,
+  strftime('%s','now'),
+  NULL
+);
+</file>
+
+<file path="apps/api/src/middleware/cors.ts">
+import type { MiddlewareHandler } from "hono";
+
+export function cors(allowedOrigin: string): MiddlewareHandler {
+  return async (c, next) => {
+    const origin = c.req.header("Origin") || "";
+    if (origin && origin === allowedOrigin) {
+      c.header("Access-Control-Allow-Origin", origin);
+      c.header("Vary", "Origin");
+      c.header("Access-Control-Allow-Headers", "content-type, x-pricecart-session");
+      c.header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
+    }
+
+    if (c.req.method === "OPTIONS") {
+      return c.body(null, 204);
+    }
+
+    await next();
+  };
+}
+</file>
+
+<file path="apps/api/src/index.ts">
+import { CartAddItemRequestSchema, CartSetItemRequestSchema } from "@pricecart/shared";
+import { Hono } from "hono";
+import { z } from "zod";
+import type { Env } from "./env";
+import { cors } from "./middleware/cors";
+import { securityHeaders } from "./middleware/security";
+import { addCartItem, clearCart, getCart, removeCartItem, setCartItemQuantity } from "./services/cart";
+import { productSearch } from "./services/productSearch";
+import { storeSearch } from "./services/storeDiscovery";
+
+const app = new Hono<{ Bindings: Env }>();
+
+// Adjust to your Pages domain once known
+const ALLOWED_ORIGIN = "http://localhost:5173";
+
+app.use("*", securityHeaders());
+app.use("*", cors(ALLOWED_ORIGIN));
+
+app.get("/health", (c) => c.json({ ok: true }));
+const SessionIdSchema = z.string().min(1).max(128);
+
+function requireSession(c: any): string {
+  const raw = c.req.header("x-pricecart-session");
+  const parsed = SessionIdSchema.safeParse(raw);
+  if (!parsed.success) throw new Error("MISSING_SESSION");
+  return parsed.data;
+}
+
+
+
+const StoreSearchQuery = z.object({
+  location: z.string().min(2).max(200),
+  radius_m: z.coerce.number().int().positive().optional(),
+  page: z.coerce.number().int().min(1).optional(),
+  page_size: z.coerce.number().int().min(1).max(50).optional()
+});
+
+const ProductSearchQuery = z.object({
+  q: z.string().min(2).max(200),
+  page: z.coerce.number().int().min(1).optional(),
+  page_size: z.coerce.number().int().min(1).max(50).optional()
+});
+
+function slicePage<T>(items: T[], page: number, pageSize: number): T[] {
+  const start = (page - 1) * pageSize;
+  return items.slice(start, start + pageSize);
+}
+
+app.get("/stores/search", async (c) => {
+  const parsed = StoreSearchQuery.safeParse({
+    location: c.req.query("location"),
+    radius_m: c.req.query("radius_m"),
+    page: c.req.query("page"),
+    page_size: c.req.query("page_size")
+  });
+
+  if (!parsed.success) {
+    return c.json({ error: "INVALID_INPUT", details: parsed.error.flatten() }, 400);
+  }
+
+  const sessionId = c.req.header("x-pricecart-session") || "anon";
+  const page = parsed.data.page ?? 1;
+  const pageSize = parsed.data.page_size ?? 20;
+
+  try {
+    const res = await storeSearch(c.env, {
+      location: parsed.data.location,
+      radius_m: parsed.data.radius_m ?? 5000,
+      session_id: sessionId
+    });
+
+    const totalCount = res.stores.length;
+    const stores = slicePage(res.stores, page, pageSize);
+
+    console.log(
+      JSON.stringify({
+        level: "info",
+        route: "/stores/search",
+        session: sessionId,
+        data_mode: res.data_mode,
+        radius_m: res.radius_m,
+        page,
+        page_size: pageSize,
+        store_count: stores.length,
+        total_count: totalCount
+      })
+    );
+
+    return c.json({
+      ...res,
+      stores,
+      page,
+      page_size: pageSize,
+      total_count: totalCount
+    });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+
+    if (msg.includes("RATE_LIMIT")) return c.json({ error: "RATE_LIMITED" }, 429);
+    if (msg.includes("NOT_FOUND")) return c.json({ error: "NOT_FOUND" }, 404);
+
+    console.log(
+      JSON.stringify({
+        level: "error",
+        route: "/stores/search",
+        session: sessionId,
+        message: "store search failed",
+        err: msg
+      })
+    );
+
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+app.get("/products/search", async (c) => {
+  const parsed = ProductSearchQuery.safeParse({
+    q: c.req.query("q"),
+    page: c.req.query("page"),
+    page_size: c.req.query("page_size")
+  });
+
+  if (!parsed.success) {
+    return c.json({ error: "INVALID_INPUT", details: parsed.error.flatten() }, 400);
+  }
+
+  const sessionId = c.req.header("x-pricecart-session") || "anon";
+  const page = parsed.data.page ?? 1;
+  const pageSize = parsed.data.page_size ?? 10;
+
+  try {
+    const res = await productSearch(c.env, {
+      q: parsed.data.q,
+      page,
+      page_size: pageSize,
+      session_id: sessionId
+    });
+
+    console.log(
+      JSON.stringify({
+        level: "info",
+        route: "/products/search",
+        session: sessionId,
+        q: parsed.data.q,
+        page,
+        page_size: pageSize,
+        product_count: res.products.length,
+        total_count: res.total_count
+      })
+    );
+
+    return c.json(res);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+
+    if (msg.includes("RATE_LIMIT")) return c.json({ error: "RATE_LIMITED" }, 429);
+
+    console.log(
+      JSON.stringify({
+        level: "error",
+        route: "/products/search",
+        session: sessionId,
+        message: "product search failed",
+        err: msg
+      })
+    );
+
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+app.get("/cart", async (c) => {
+  try {
+    const session_id = requireSession(c);
+    const cart = await getCart(c.env, session_id);
+    return c.json(cart);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return c.json(
+      { error: msg === "MISSING_SESSION" ? "MISSING_SESSION" : "INTERNAL_ERROR" },
+      msg === "MISSING_SESSION" ? 401 : 500
+    );
+  }
+});
+
+app.post("/cart/items", async (c) => {
+  try {
+    const session_id = requireSession(c);
+    const body = await c.req.json();
+    const parsed = CartAddItemRequestSchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: "INVALID_INPUT" }, 400);
+
+    const cart = await addCartItem(c.env, { session_id, ...parsed.data });
+    return c.json(cart);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
+    if (msg === "PRODUCT_NOT_FOUND") return c.json({ error: "PRODUCT_NOT_FOUND" }, 404);
+    if (msg === "CART_TOO_LARGE") return c.json({ error: "CART_TOO_LARGE" }, 413);
+    if (msg === "QUANTITY_TOO_LARGE") return c.json({ error: "QUANTITY_TOO_LARGE" }, 400);
+    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+app.patch("/cart/items/:upc", async (c) => {
+  try {
+    const session_id = requireSession(c);
+    const upc = c.req.param("upc");
+    const body = await c.req.json();
+    const parsed = CartSetItemRequestSchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: "INVALID_INPUT" }, 400);
+
+    const cart = await setCartItemQuantity(c.env, { session_id, upc, quantity: parsed.data.quantity });
+    return c.json(cart);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
+    if (msg === "QUANTITY_TOO_LARGE") return c.json({ error: "QUANTITY_TOO_LARGE" }, 400);
+    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+app.delete("/cart/items/:upc", async (c) => {
+  try {
+    const session_id = requireSession(c);
+    const upc = c.req.param("upc");
+    const cart = await removeCartItem(c.env, { session_id, upc });
+    return c.json(cart);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
+    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+app.post("/cart/clear", async (c) => {
+  try {
+    const session_id = requireSession(c);
+    const cart = await clearCart(c.env, session_id);
+    return c.json(cart);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
+    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+export default app;
+</file>
+
+<file path="apps/api/vite.config.ts">
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+
+// https://vite.dev/config/
+export default defineConfig(async ({ mode }) => {
+  // Vitest runs Vite in "test" mode and sets VITEST in the config process env.
+  const isVitest = !!process.env.VITEST || mode === "test";
+  const plugins = [react()];
+
+  if (!isVitest) {
+    const { cloudflare } = await import("@cloudflare/vite-plugin");
+    plugins.push(cloudflare());
+  }
+
+  return { plugins };
+});
+</file>
+
+<file path="apps/web/src/lib/api.ts">
+import type {
+  Cart,
+  CartAddItemRequest,
+  CartSetItemRequest,
+  ProductLookupResponse,
+  ProductSearchResponse,
+  StoreSearchResponse
+} from "@pricecart/shared";
+import { getSessionId } from "./session";
+
+type FetchJsonInit = Omit<RequestInit, "body"> & { json?: unknown };
+
+function apiBase(): string {
+  // Recommended dev value: http://localhost:8787/api
+  return (import.meta as any).env?.VITE_API_BASE_URL ?? "http://localhost:8787/api";
+}
+
+async function fetchJson<T>(url: string, init: FetchJsonInit = {}): Promise<T> {
+  const headers = new Headers(init.headers);
+  headers.set("x-pricecart-session", getSessionId());
+
+  let body: BodyInit | undefined = undefined;
+  if (init.json !== undefined) {
+    headers.set("content-type", "application/json");
+    body = JSON.stringify(init.json);
+  }
+
+  const res = await fetch(url, { ...init, headers, body });
+
+  if (!res.ok) {
+    const payload = await res.json().catch(() => ({}));
+    throw new Error(payload?.error || `HTTP_${res.status}`);
+  }
+
+  return (await res.json()) as T;
+}
+
+export async function fetchStores(params: { location: string; radius_m?: number }): Promise<StoreSearchResponse> {
+  const base = apiBase();
+  const url = new URL(base + "/stores/search");
+  url.searchParams.set("location", params.location);
+  url.searchParams.set("radius_m", String(params.radius_m ?? 1500));
+  return fetchJson<StoreSearchResponse>(url.toString());
+}
+
+export async function lookupProductByUpc(upc: string): Promise<ProductLookupResponse> {
+  const base = apiBase();
+  const url = new URL(base + `/products/lookup/${encodeURIComponent(upc)}`);
+  return fetchJson<ProductLookupResponse>(url.toString());
+}
+
+export async function searchProducts(params: { q: string; page?: number; page_size?: number }): Promise<ProductSearchResponse> {
+  const base = apiBase();
+  const url = new URL(base + "/products/search");
+  url.searchParams.set("q", params.q);
+  url.searchParams.set("page", String(params.page ?? 1));
+  url.searchParams.set("page_size", String(params.page_size ?? 10));
+  return fetchJson<ProductSearchResponse>(url.toString());
+}
+
+// -------------------------
+// Phase 3: Cart
+// -------------------------
+
+export async function getCart(): Promise<Cart> {
+  const base = apiBase();
+  const url = new URL(base + "/cart");
+  return fetchJson<Cart>(url.toString());
+}
+
+export async function addCartItem(req: CartAddItemRequest): Promise<Cart> {
+  const base = apiBase();
+  const url = new URL(base + "/cart/items");
+  return fetchJson<Cart>(url.toString(), { method: "POST", json: req });
+}
+
+export async function setCartItem(upc: string, req: CartSetItemRequest): Promise<Cart> {
+  const base = apiBase();
+  const url = new URL(base + `/cart/items/${encodeURIComponent(upc)}`);
+  return fetchJson<Cart>(url.toString(), { method: "PATCH", json: req });
+}
+
+export async function removeCartItem(upc: string): Promise<Cart> {
+  const base = apiBase();
+  const url = new URL(base + `/cart/items/${encodeURIComponent(upc)}`);
+  return fetchJson<Cart>(url.toString(), { method: "DELETE" });
+}
+
+export async function clearCart(): Promise<Cart> {
+  const base = apiBase();
+  const url = new URL(base + "/cart/clear");
+  return fetchJson<Cart>(url.toString(), { method: "POST", json: {} });
+}
+</file>
+
+<file path="apps/web/src/App.tsx">
+import type { Product, ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
+import "leaflet/dist/leaflet.css";
+import { useMemo, useState } from "react";
+import { MapContainer, Marker, Popup, TileLayer } from "react-leaflet";
+import { fetchStores, lookupProductByUpc, searchProducts } from "./lib/api";
+import { useCart } from "./lib/cart";
+
+function formatErrorMessage(err: unknown) {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function qtyLabel(p: { quantity?: { raw: string | null; value: number | null; unit: string | null } | null }) {
+  const q = p.quantity;
+  if (!q) return "";
+  if (q.raw) return q.raw;
+  if (q.value && q.unit) return `${q.value} ${q.unit}`;
+  return "";
+}
+
+export default function App() {
+  const [view, setView] = useState<"stores" | "products" | "cart">("stores");
+
+  // Phase 1: Stores
+  const [location, setLocation] = useState("10001");
+  const [radius, setRadius] = useState(1500);
+  const [stores, setStores] = useState<StoreSearchResponse | null>(null);
+  const [sStatus, setSStatus] = useState<string>("");
+
+  // Phase 2: Products
+  const [upc, setUpc] = useState("");
+  const [lookup, setLookup] = useState<ProductLookupResponse | null>(null);
+  const [q, setQ] = useState("");
+  const [search, setSearch] = useState<ProductSearchResponse | null>(null);
+  const [pStatus, setPStatus] = useState<string>("");
+
+  // Phase 3: Cart
+  const cart = useCart();
+
+  const mapCenter = useMemo(() => {
+    const first = stores?.stores?.[0];
+    return first ? { lat: first.lat, lon: first.lon } : { lat: 40.7484, lon: -73.9967 }; // Midtown fallback
+  }, [stores]);
+
+  async function onSearchStores() {
+    setSStatus("Loading...");
+    setStores(null);
+    try {
+      const res = await fetchStores({ location, radius_m: radius });
+      setStores(res);
+      setSStatus("");
+    } catch (err) {
+      setSStatus(formatErrorMessage(err));
+    }
+  }
+
+  async function onLookupUpc() {
+    setPStatus("Loading...");
+    setLookup(null);
+    try {
+      const res = await lookupProductByUpc(upc.trim());
+      setLookup(res);
+      setPStatus("");
+    } catch (err) {
+      setPStatus(formatErrorMessage(err));
+    }
+  }
+
+  async function onSearchProducts() {
+    setPStatus("Loading...");
+    setSearch(null);
+    try {
+      const res = await searchProducts({ q: q.trim(), page: 1, page_size: 10 });
+      setSearch(res);
+      setPStatus("");
+    } catch (err) {
+      setPStatus(formatErrorMessage(err));
+    }
+  }
+
+  async function addProductToCart(p: Product) {
+    await cart.add(p.upc, 1);
+    setView("cart");
+  }
+
+  return (
+    <div style={{ maxWidth: 980, margin: "0 auto", padding: 16 }}>
+      <header style={{ display: "flex", gap: 8, alignItems: "center", justifyContent: "space-between" }}>
+        <h2 style={{ margin: 0 }}>PriceCart</h2>
+        <nav style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => setView("stores")} disabled={view === "stores"}>
+            Stores
+          </button>
+          <button onClick={() => setView("products")} disabled={view === "products"}>
+            Products
+          </button>
+          <button onClick={() => setView("cart")} disabled={view === "cart"}>
+            Cart {cart.cart ? `(${cart.cart.item_count})` : ""}
+          </button>
+        </nav>
+      </header>
+
+      <hr />
+
+      {view === "stores" && (
+        <section>
+          <h3>Find nearby stores</h3>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <label>
+              Location
+              <input value={location} onChange={(e) => setLocation(e.target.value)} style={{ marginLeft: 8 }} />
+            </label>
+            <label>
+              Radius (m)
+              <input
+                type="number"
+                value={radius}
+                onChange={(e) => setRadius(Number(e.target.value))}
+                style={{ marginLeft: 8, width: 120 }}
+              />
+            </label>
+            <button onClick={onSearchStores}>Search</button>
+          </div>
+
+          {sStatus && <p>{sStatus}</p>}
+
+          {stores && (
+            <>
+              <p>
+                Data: <b>{stores.data_mode}</b>
+              </p>
+
+              <div style={{ height: 360, borderRadius: 12, overflow: "hidden", border: "1px solid #ddd" }}>
+                <MapContainer center={[mapCenter.lat, mapCenter.lon]} zoom={14} style={{ height: "100%" }}>
+                  <TileLayer attribution="&copy; OpenStreetMap" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+                  {stores.stores.map((s) => (
+                    <Marker key={s.id} position={[s.lat, s.lon]}>
+                      <Popup>
+                        <b>{s.name}</b>
+                        <div>{Math.round(s.distance_m)}m away</div>
+                      </Popup>
+                    </Marker>
+                  ))}
+                </MapContainer>
+              </div>
+
+              <h4>Results</h4>
+              <ul>
+                {stores.stores.map((s) => (
+                  <li key={s.id}>
+                    <b>{s.name}</b> - {Math.round(s.distance_m)}m
+                  </li>
+                ))}
+              </ul>
+
+              <small>
+                {stores.attribution.text} {stores.attribution.links.map((l) => (
+                  <a key={l.href} href={l.href} target="_blank" rel="noreferrer" style={{ marginLeft: 8 }}>
+                    {l.label}
+                  </a>
+                ))}
+              </small>
+            </>
+          )}
+        </section>
+      )}
+
+      {view === "products" && (
+        <section>
+          <h3>Find products</h3>
+
+          <div style={{ display: "grid", gap: 12 }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <label>
+                UPC
+                <input value={upc} onChange={(e) => setUpc(e.target.value)} style={{ marginLeft: 8 }} />
+              </label>
+              <button onClick={onLookupUpc}>Lookup</button>
+              {lookup?.product && (
+                <button onClick={() => addProductToCart(lookup.product)}>Add to cart</button>
+              )}
+            </div>
+
+            {lookup && (
+              <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
+                <b>{lookup.product.name}</b>
+                <div>{lookup.product.brand ?? ""}</div>
+                <div style={{ opacity: 0.8 }}>{qtyLabel(lookup.product)}</div>
+              </div>
+            )}
+
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <label>
+                Search
+                <input value={q} onChange={(e) => setQ(e.target.value)} style={{ marginLeft: 8, width: 260 }} />
+              </label>
+              <button onClick={onSearchProducts}>Search</button>
+            </div>
+
+            {pStatus && <p>{pStatus}</p>}
+
+            {search && (
+              <>
+                <p>
+                  Results: <b>{search.total}</b>
+                </p>
+                <ul style={{ display: "grid", gap: 8, paddingLeft: 16 }}>
+                  {search.products.map((p) => (
+                    <li key={p.upc} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <span style={{ flex: 1 }}>
+                        <b>{p.name}</b> {p.brand ? <span style={{ opacity: 0.8 }}>({p.brand})</span> : null}
+                      </span>
+                      <button onClick={() => cart.add(p.upc, 1)}>Add</button>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </div>
+        </section>
+      )}
+
+      {view === "cart" && (
+        <section>
+          <h3>Your cart</h3>
+
+          {cart.status === "loading" && <p>Loading...</p>}
+          {cart.status === "error" && <p>Error: {cart.error}</p>}
+
+          {cart.cart && cart.cart.item_count === 0 && <p>Your cart is empty. Add items from the Products tab.</p>}
+
+          {cart.cart && cart.cart.item_count > 0 && (
+            <>
+              <p>
+                Items: <b>{cart.cart.item_count}</b> | Total units: <b>{cart.cart.total_units}</b>
+              </p>
+
+              <ul style={{ display: "grid", gap: 12, paddingLeft: 16 }}>
+                {cart.cart.items.map((it) => (
+                  <li key={it.upc} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8 }}>
+                    <div>
+                      <b>{it.name}</b>
+                      <div style={{ opacity: 0.8 }}>
+                        {it.brand ?? ""} {it.quantity?.value && it.quantity?.unit ? `- ${it.quantity.value} ${it.quantity.unit}` : ""}
+                      </div>
+                      <div style={{ opacity: 0.7, fontSize: 12 }}>{it.upc}</div>
+                    </div>
+
+                    <div style={{ display: "flex", gap: 8, alignItems: "center", justifyContent: "flex-end" }}>
+                      <button onClick={() => cart.setQuantity(it.upc, Math.max(1, it.count - 1))} aria-label="Decrease">
+                        -
+                      </button>
+                      <input
+                        type="number"
+                        min={1}
+                        max={99}
+                        value={it.count}
+                        onChange={(e) => cart.setQuantity(it.upc, Math.max(1, Math.min(99, Number(e.target.value) || 1)))}
+                        style={{ width: 64 }}
+                      />
+                      <button onClick={() => cart.setQuantity(it.upc, Math.min(99, it.count + 1))} aria-label="Increase">
+                        +
+                      </button>
+                      <button onClick={() => cart.remove(it.upc)}>Remove</button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+
+              <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                <button onClick={cart.clear}>Clear cart</button>
+                <button onClick={() => alert("Phase 4: Compare prices (quote endpoint)")}>Compare prices</button>
+              </div>
+            </>
+          )}
+        </section>
+      )}
+
+      <footer style={{ marginTop: 24, opacity: 0.75 }}>
+        <small>
+          Tip: Open your browser devtools Network tab to verify cart calls. If you hit rate limits, wait briefly and try again.
+        </small>
+      </footer>
+    </div>
+  );
+}
+</file>
+
+<file path="apps/web/.env.example">
+VITE_API_BASE_URL=http://localhost:8787
+VITE_API_BASE_URL=http://localhost:8787/api
+</file>
+
+<file path="apps/web/package.json">
+{
+  "name": "web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@pricecart/shared": "file:../../packages/shared",
+    "leaflet": "1.9.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-leaflet": "5.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/leaflet": "1.9.21",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "eslint": "^9.39.1",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.4.24",
+    "globals": "^16.5.0",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.46.4",
+    "vite": "^7.2.4",
+    "vitest": "^4.0.16"
+  }
+}
+</file>
+
+<file path="packages/shared/src/index.ts">
+export * from "./cart.js";
+export * from "./product.js";
+export * from "./store.js";
+</file>
+
 <file path="package.json">
 {
   "name": "pricecart",
@@ -3210,6 +3753,7 @@ packages/shared/dist/
   },
   "devDependencies": {
     "@cloudflare/workers-types": "4.20251225.0",
+    "@cloudflare/vite-plugin": "1.19.0",
     "@types/node": "25.0.3",
     "miniflare": "4.20251217.0",
     "vitest": "4.0.16"

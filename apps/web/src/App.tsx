@@ -1,8 +1,8 @@
-import type { Product, ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
+import type { CartQuoteResponse, Product, ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
 import "leaflet/dist/leaflet.css";
 import { useMemo, useState } from "react";
 import { MapContainer, Marker, Popup, TileLayer } from "react-leaflet";
-import { fetchStores, lookupProductByUpc, searchProducts } from "./lib/api";
+import { fetchStores, lookupProductByUpc, quoteCart, searchProducts, submitPrice } from "./lib/api";
 import { useCart } from "./lib/cart";
 
 function formatErrorMessage(err: unknown) {
@@ -35,6 +35,12 @@ export default function App() {
 
   // Phase 3: Cart
   const cart = useCart();
+  const [quote, setQuote] = useState<CartQuoteResponse | null>(null);
+  const [quoteStatus, setQuoteStatus] = useState<string>("");
+  const [submitStoreId, setSubmitStoreId] = useState<string>("");
+  const [submitUpc, setSubmitUpc] = useState<string>("");
+  const [submitPriceCents, setSubmitPriceCents] = useState<number>(0);
+  const [submitStatus, setSubmitStatus] = useState<string>("");
 
   const mapCenter = useMemo(() => {
     const first = stores?.stores?.[0];
@@ -80,6 +86,45 @@ export default function App() {
   async function addProductToCart(p: Product) {
     await cart.add(p.upc, 1);
     setView("cart");
+  }
+
+  async function onComparePrices() {
+    setQuoteStatus("Loading...");
+    setQuote(null);
+
+    try {
+      const storeIds = (stores?.stores ?? []).slice(0, 3).map((s) => s.id);
+      if (storeIds.length === 0) {
+        setQuoteStatus("Search stores first (Phase 1). Then compare.");
+        return;
+      }
+
+      const res = await quoteCart({ store_ids: storeIds });
+      setQuote(res);
+      setQuoteStatus("");
+
+      // helpful default for submission UI
+      setSubmitStoreId(storeIds[0] ?? "");
+    } catch (err) {
+      setQuoteStatus(formatErrorMessage(err));
+    }
+  }
+
+  async function onSubmitPrice() {
+    setSubmitStatus("Submitting...");
+    try {
+      await submitPrice({
+        store_id: submitStoreId,
+        upc: submitUpc.trim(),
+        price_cents: submitPriceCents,
+        currency: "USD",
+        evidence_type: "manual"
+      });
+
+      setSubmitStatus("Saved. Re-run compare to see updates.");
+    } catch (err) {
+      setSubmitStatus(formatErrorMessage(err));
+    }
   }
 
   return (
@@ -268,8 +313,80 @@ export default function App() {
 
               <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
                 <button onClick={cart.clear}>Clear cart</button>
-                <button onClick={() => alert("Phase 4: Compare prices (quote endpoint)")}>Compare prices</button>
+                <button onClick={onComparePrices}>Compare prices</button>
               </div>
+
+              {quoteStatus && <p>{quoteStatus}</p>}
+
+              {quote && (
+                <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
+                  <h4 style={{ marginTop: 0 }}>Price comparison</h4>
+
+                  {quote.cheapest_store_id ? (
+                    <p>
+                      Cheapest (by completeness, then adjusted total): <b>{quote.cheapest_store_id}</b>
+                    </p>
+                  ) : null}
+
+                  {quote.warnings?.length ? (
+                    <p style={{ opacity: 0.8 }}>
+                      Warnings: {quote.warnings.join(", ")}
+                    </p>
+                  ) : null}
+
+                  <ul style={{ display: "grid", gap: 12, paddingLeft: 16 }}>
+                    {[...quote.stores]
+                      .sort((a, b) => a.adjusted_total_cents - b.adjusted_total_cents)
+                      .map((s) => (
+                        <li key={s.store_id}>
+                          <b>{s.store_name}</b> ({s.store_id})
+                          <div>
+                            Total: <b>${(s.total_cents / 100).toFixed(2)}</b> | Missing: <b>{s.missing_count}</b> | Completeness:{" "}
+                            <b>{Math.round(s.completeness * 100)}%</b>
+                          </div>
+                          <div style={{ opacity: 0.8 }}>
+                            Adjusted total: <b>${(s.adjusted_total_cents / 100).toFixed(2)}</b>
+                          </div>
+                        </li>
+                      ))}
+                  </ul>
+
+                  <hr />
+
+                  <h4>Submit a missing price (manual)</h4>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                    <label>
+                      Store
+                      <select value={submitStoreId} onChange={(e) => setSubmitStoreId(e.target.value)} style={{ marginLeft: 8 }}>
+                        {(stores?.stores ?? []).slice(0, 10).map((s) => (
+                          <option key={s.id} value={s.id}>
+                            {s.name} ({s.id})
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label>
+                      UPC
+                      <input value={submitUpc} onChange={(e) => setSubmitUpc(e.target.value)} style={{ marginLeft: 8, width: 160 }} />
+                    </label>
+
+                    <label>
+                      Price (cents)
+                      <input
+                        type="number"
+                        value={submitPriceCents}
+                        onChange={(e) => setSubmitPriceCents(Number(e.target.value))}
+                        style={{ marginLeft: 8, width: 120 }}
+                      />
+                    </label>
+
+                    <button onClick={onSubmitPrice}>Submit</button>
+                  </div>
+
+                  {submitStatus && <p>{submitStatus}</p>}
+                </div>
+              )}
             </>
           )}
         </section>
