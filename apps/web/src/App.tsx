@@ -1,4 +1,4 @@
-import type { CartQuoteResponse, Product, ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
+import type { CartLine, CartQuoteResponse, Product, ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
 import "leaflet/dist/leaflet.css";
 import { useMemo, useState } from "react";
 import { MapContainer, Marker, Popup, TileLayer } from "react-leaflet";
@@ -14,6 +14,23 @@ function qtyLabel(p: { quantity?: { raw: string | null; value: number | null; un
   if (!q) return "";
   if (q.raw) return q.raw;
   if (q.value && q.unit) return `${q.value} ${q.unit}`;
+  return "";
+}
+
+function formatObservedAt(observedAt: number | null | undefined) {
+  if (!observedAt) return "";
+  try {
+    return new Date(observedAt * 1000).toLocaleString();
+  } catch {
+    return "";
+  }
+}
+
+function sourceLabel(source: string | null | undefined) {
+  if (source === "kroger") return "Live price (Kroger)";
+  if (source === "open_prices") return "Dataset (Open Prices)";
+  if (source === "community") return "Community";
+  if (source === "seed") return "Seed";
   return "";
 }
 
@@ -35,6 +52,11 @@ export default function App() {
 
   // Phase 3: Cart
   const cart = useCart();
+  const cartItemByUpc = useMemo(() => {
+    const m = new Map<string, CartLine>();
+    for (const it of cart.cart?.items ?? []) m.set(it.upc, it);
+    return m;
+  }, [cart.cart]);
   const [quote, setQuote] = useState<CartQuoteResponse | null>(null);
   const [quoteStatus, setQuoteStatus] = useState<string>("");
   const [submitStoreId, setSubmitStoreId] = useState<string>("");
@@ -347,6 +369,41 @@ export default function App() {
                           <div style={{ opacity: 0.8 }}>
                             Adjusted total: <b>${(s.adjusted_total_cents / 100).toFixed(2)}</b>
                           </div>
+                          <details style={{ marginTop: 8 }}>
+                            <summary>Line items</summary>
+                            <ul style={{ paddingLeft: 16, marginTop: 8, display: "grid", gap: 6 }}>
+                              {s.lines.map((ln) => {
+                                const item = cartItemByUpc.get(ln.upc);
+                                const title = item ? `${item.name}${item.brand ? ` (${item.brand})` : ""}` : ln.upc;
+                                const when = formatObservedAt(ln.observed_at ?? null);
+                                const src = sourceLabel(ln.source ?? null);
+                                const metaParts: string[] = [];
+                                if (src) metaParts.push(src);
+                                if (when) metaParts.push(when);
+                                const meta = metaParts.join(" • ");
+
+                                return (
+                                  <li key={ln.upc}>
+                                    <div>
+                                      <b>{title}</b> x{ln.quantity} {item ? qtyLabel(item) : ""}
+                                    </div>
+                                    {ln.missing ? (
+                                      <div style={{ opacity: 0.8 }}>Missing price</div>
+                                    ) : (
+                                      <div style={{ opacity: 0.9 }}>
+                                        ${(ln.extended_price_cents! / 100).toFixed(2)}{" "}
+                                        {meta && (
+                                          <span style={{ opacity: 0.75 }}>
+                                            ({meta})
+                                          </span>
+                                        )}
+                                      </div>
+                                    )}
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          </details>
                         </li>
                       ))}
                   </ul>

@@ -48,6 +48,8 @@ apps/
       0003_phase2_product_identity.sql
       0004_phase2_seed_products.sql
       0005_phase3_cart.sql
+      0006_phase4_pricing.sql
+      0007_phase4_seed_prices.sql
     src/
       lib/
         cache.ts
@@ -72,6 +74,8 @@ apps/
         overpass.ts
       services/
         cart.ts
+        pricing.test.ts
+        pricing.ts
         productCatalog.ts
         productSearch.ts
         storeDiscovery.ts
@@ -125,6 +129,7 @@ packages/
     src/
       cart.ts
       index.ts
+      pricing.ts
       product.ts
       store.ts
     package.json
@@ -243,6 +248,108 @@ CREATE TABLE IF NOT EXISTS cart_items (
 
 CREATE INDEX IF NOT EXISTS idx_cart_items_session
   ON cart_items(session_id);
+</file>
+
+<file path="apps/api/migrations/0006_phase4_pricing.sql">
+-- Phase 4: pricing snapshots (Open Prices + community)
+
+CREATE TABLE IF NOT EXISTS price_snapshots (
+  id TEXT PRIMARY KEY,
+  store_id TEXT NOT NULL,
+  upc TEXT NOT NULL,
+
+  price_cents INTEGER NOT NULL,
+  currency TEXT NOT NULL,
+
+  observed_at INTEGER NOT NULL,   -- when the price was observed
+  source TEXT NOT NULL,           -- open_prices | community | kroger
+  evidence_type TEXT NOT NULL,    -- dataset | manual | receipt_text
+
+  confidence REAL NOT NULL,       -- 0.0 - 1.0 (simple, explainable)
+  submitter_session_id TEXT,      -- only for community submissions (anonymous)
+
+  flags_json TEXT,                -- optional moderation/outlier info
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_price_snapshots_store_upc_observed
+  ON price_snapshots(store_id, upc, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_price_snapshots_upc_observed
+  ON price_snapshots(upc, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_price_snapshots_source_observed
+  ON price_snapshots(source, observed_at DESC);
+</file>
+
+<file path="apps/api/migrations/0007_phase4_seed_prices.sql">
+-- Phase 4 seed pricing for demo + tests
+
+-- Use the same seed stores from 0002 and seed products from 0004
+-- UPCs:
+-- 0000000000001 Seed Whole Milk
+-- 0000000000002 Seed Peanut Butter
+-- 012345678905  Seed Honeycrisp Apples
+
+-- Store A (seed-1): cheapest overall
+INSERT OR REPLACE INTO price_snapshots (
+  id, store_id, upc, price_cents, currency, observed_at, source, evidence_type,
+  confidence, submitter_session_id, flags_json, created_at
+) VALUES
+(
+  'op-seed-1-milk', 'seed-1', '0000000000001', 399, 'USD', strftime('%s','now') - 86400,
+  'open_prices', 'dataset', 0.75, NULL, NULL, strftime('%s','now')
+),
+(
+  'op-seed-1-pb', 'seed-1', '0000000000002', 549, 'USD', strftime('%s','now') - 172800,
+  'open_prices', 'dataset', 0.75, NULL, NULL, strftime('%s','now')
+),
+(
+  'op-seed-1-apples', 'seed-1', '012345678905', 699, 'USD', strftime('%s','now') - 259200,
+  'open_prices', 'dataset', 0.75, NULL, NULL, strftime('%s','now')
+);
+
+-- Store B (seed-2): slightly more expensive
+INSERT OR REPLACE INTO price_snapshots (
+  id, store_id, upc, price_cents, currency, observed_at, source, evidence_type,
+  confidence, submitter_session_id, flags_json, created_at
+) VALUES
+(
+  'op-seed-2-milk', 'seed-2', '0000000000001', 429, 'USD', strftime('%s','now') - 86400,
+  'open_prices', 'dataset', 0.75, NULL, NULL, strftime('%s','now')
+),
+(
+  'op-seed-2-pb', 'seed-2', '0000000000002', 599, 'USD', strftime('%s','now') - 172800,
+  'open_prices', 'dataset', 0.75, NULL, NULL, strftime('%s','now')
+),
+(
+  'op-seed-2-apples', 'seed-2', '012345678905', 749, 'USD', strftime('%s','now') - 259200,
+  'open_prices', 'dataset', 0.75, NULL, NULL, strftime('%s','now')
+);
+
+-- Store C (seed-3): missing apples initially (forces missing-item behavior)
+INSERT OR REPLACE INTO price_snapshots (
+  id, store_id, upc, price_cents, currency, observed_at, source, evidence_type,
+  confidence, submitter_session_id, flags_json, created_at
+) VALUES
+(
+  'op-seed-3-milk', 'seed-3', '0000000000001', 409, 'USD', strftime('%s','now') - 86400,
+  'open_prices', 'dataset', 0.75, NULL, NULL, strftime('%s','now')
+),
+(
+  'op-seed-3-pb', 'seed-3', '0000000000002', 579, 'USD', strftime('%s','now') - 172800,
+  'open_prices', 'dataset', 0.75, NULL, NULL, strftime('%s','now')
+);
+
+-- OPTIONAL: a seeded community submission example
+INSERT OR REPLACE INTO price_snapshots (
+  id, store_id, upc, price_cents, currency, observed_at, source, evidence_type,
+  confidence, submitter_session_id, flags_json, created_at
+) VALUES
+(
+  'community-seed-3-apples', 'seed-3', '012345678905', 799, 'USD', strftime('%s','now') - 43200,
+  'community', 'manual', 0.45, 'seed-session', '{"note":"seeded manual price"}', strftime('%s','now')
+);
 </file>
 
 <file path="apps/api/src/lib/cache.ts">
@@ -1056,6 +1163,315 @@ export async function clearCart(env: EnvLike, session_id: string): Promise<Cart>
 
   await touchCart(env, session_id);
   return getCart(env, session_id);
+}
+</file>
+
+<file path="apps/api/src/services/pricing.test.ts">
+import { describe, expect, it } from "vitest";
+
+function adjustedTotal(total: number, completeness: number): number {
+  const denom = Math.max(0.25, completeness);
+  return Math.round(total / denom);
+}
+
+describe("pricing helpers", () => {
+  it("penalizes missing items by inflating adjusted total", () => {
+    expect(adjustedTotal(1000, 1.0)).toBe(1000);
+    expect(adjustedTotal(1000, 0.5)).toBe(2000);
+    expect(adjustedTotal(1000, 0.25)).toBe(4000);
+  });
+});
+</file>
+
+<file path="apps/api/src/services/pricing.ts">
+import type { CartQuoteResponse, EvidenceType, FreshnessBucket, PriceSource } from "@pricecart/shared";
+import { takeToken } from "../lib/rateLimit";
+import { nowSec } from "../lib/time";
+
+type EnvLike = { DB: D1Database };
+
+const RL_QUOTE = { capacity: 60, refillPerSec: 1 / 2, cost: 1 };   // ~60/min/session
+const RL_SUBMIT = { capacity: 20, refillPerSec: 1 / 60, cost: 1 }; // ~20/min/session
+
+type CartItemRow = { upc: string; quantity: number };
+
+type StoreRow = { id: string; name: string };
+
+type PriceRow = {
+  upc: string;
+  price_cents: number;
+  currency: string;
+  observed_at: number;
+  source: PriceSource;
+  evidence_type: EvidenceType;
+  confidence: number;
+};
+
+function clamp01(x: number): number {
+  if (x < 0) return 0;
+  if (x > 1) return 1;
+  return x;
+}
+
+function freshnessBucket(now: number, observedAt: number): FreshnessBucket {
+  const ageSec = Math.max(0, now - observedAt);
+  const ageDays = ageSec / 86400;
+  if (ageDays <= 2) return "fresh";
+  if (ageDays <= 7) return "recent";
+  if (ageDays <= 30) return "stale";
+  return "old";
+}
+
+function adjustedTotal(total: number, completeness: number): number {
+  // Penalize missing items. If completeness is low, the total is less trustworthy.
+  // This keeps ranking honest: a store missing half the prices should not “win” by default.
+  const denom = Math.max(0.25, completeness);
+  return Math.round(total / denom);
+}
+
+function median(nums: number[]): number | null {
+  if (nums.length === 0) return null;
+  const a = [...nums].sort((x, y) => x - y);
+  const mid = Math.floor(a.length / 2);
+  return a.length % 2 === 1 ? a[mid] : Math.round((a[mid - 1] + a[mid]) / 2);
+}
+
+export async function quoteCart(
+  env: EnvLike,
+  input: { session_id: string; store_ids: string[] }
+): Promise<CartQuoteResponse> {
+  const ok = await takeToken(env.DB, `quote:${input.session_id}`, RL_QUOTE);
+  if (!ok) throw new Error("RATE_LIMITED");
+
+  const storeIds = Array.from(new Set(input.store_ids)).slice(0, 20);
+
+  // Load cart items (server-backed)
+  const cartRows = await env.DB.prepare(
+    `SELECT upc, quantity
+     FROM cart_items
+     WHERE session_id = ?
+     ORDER BY updated_at DESC`
+  )
+    .bind(input.session_id)
+    .all<CartItemRow>();
+
+  const cartItems = cartRows.results;
+  const itemCount = cartItems.length;
+
+  const t = nowSec();
+  const warnings: string[] = [];
+
+  if (itemCount === 0) {
+    warnings.push("CART_EMPTY");
+  }
+
+  // Load store names
+  const storePlaceholders = storeIds.map(() => "?").join(",");
+  const storeRows = await env.DB.prepare(
+    `SELECT id, name FROM stores WHERE id IN (${storePlaceholders})`
+  )
+    .bind(...storeIds)
+    .all<StoreRow>();
+
+  const storesById = new Map(storeRows.results.map((s) => [s.id, s]));
+  const resolvedStoreIds = storeIds.filter((id) => storesById.has(id));
+  const missingStores = storeIds.filter((id) => !storesById.has(id));
+  if (missingStores.length) warnings.push(`UNKNOWN_STORES:${missingStores.join(",")}`);
+
+  const upcs = cartItems.map((c) => c.upc);
+
+  const outStores = [] as CartQuoteResponse["stores"];
+
+  for (const store_id of resolvedStoreIds) {
+    const store = storesById.get(store_id)!;
+
+    const priceMap = new Map<string, PriceRow>();
+
+    if (upcs.length > 0) {
+      const inPlaceholders = upcs.map(() => "?").join(",");
+      // Window function: pick the “best” row per UPC by observed_at then confidence
+      const rows = await env.DB.prepare(
+        `SELECT upc, price_cents, currency, observed_at, source, evidence_type, confidence
+         FROM (
+           SELECT
+             upc, price_cents, currency, observed_at, source, evidence_type, confidence,
+             ROW_NUMBER() OVER (PARTITION BY upc ORDER BY observed_at DESC, confidence DESC) AS rn
+           FROM price_snapshots
+           WHERE store_id = ? AND upc IN (${inPlaceholders})
+         )
+         WHERE rn = 1`
+      )
+        .bind(store_id, ...upcs)
+        .all<PriceRow>();
+
+      for (const r of rows.results) priceMap.set(r.upc, r);
+    }
+
+    let total = 0;
+    let matched = 0;
+    let missing = 0;
+
+    const lines = cartItems.map((it) => {
+      const p = priceMap.get(it.upc);
+      if (!p) {
+        missing += 1;
+        return {
+          upc: it.upc,
+          quantity: it.quantity,
+          unit_price_cents: null,
+          extended_price_cents: null,
+          missing: true,
+          observed_at: null,
+          source: null,
+          evidence_type: null,
+          confidence: null,
+          freshness: null
+        };
+      }
+
+      matched += 1;
+      const ext = p.price_cents * it.quantity;
+      total += ext;
+
+      return {
+        upc: it.upc,
+        quantity: it.quantity,
+        unit_price_cents: p.price_cents,
+        extended_price_cents: ext,
+        missing: false,
+        observed_at: p.observed_at,
+        source: p.source,
+        evidence_type: p.evidence_type,
+        confidence: clamp01(p.confidence),
+        freshness: freshnessBucket(t, p.observed_at)
+      };
+    });
+
+    const completeness = itemCount === 0 ? 0 : matched / itemCount;
+
+    outStores.push({
+      store_id,
+      store_name: store.name,
+      currency: "USD",
+      item_count: itemCount,
+      matched_count: matched,
+      missing_count: missing,
+      completeness,
+      total_cents: total,
+      adjusted_total_cents: adjustedTotal(total, completeness),
+      lines
+    });
+  }
+
+  // Choose cheapest: prefer higher completeness, then lower adjusted total
+  const ranked = [...outStores].sort((a, b) => {
+    if (a.completeness !== b.completeness) return b.completeness - a.completeness;
+    if (a.adjusted_total_cents !== b.adjusted_total_cents) return a.adjusted_total_cents - b.adjusted_total_cents;
+    return a.total_cents - b.total_cents;
+  });
+
+  const cheapest = ranked.length ? ranked[0] : null;
+
+  return {
+    session_id: input.session_id,
+    generated_at: t,
+    currency: "USD",
+    cheapest_store_id: cheapest ? cheapest.store_id : null,
+    stores: outStores,
+    warnings
+  };
+}
+
+export async function submitPrice(
+  env: EnvLike,
+  input: {
+    session_id: string;
+    store_id: string;
+    upc: string;
+    price_cents: number;
+    currency: string;
+    observed_at?: number;
+    evidence_type: EvidenceType;
+  }
+): Promise<{ snapshot_id: string }> {
+  const ok = await takeToken(env.DB, `price_submit:${input.session_id}`, RL_SUBMIT);
+  if (!ok) throw new Error("RATE_LIMITED");
+
+  // Store must exist
+  const store = await env.DB.prepare("SELECT id FROM stores WHERE id = ?")
+    .bind(input.store_id)
+    .first<{ id: string }>();
+  if (!store) throw new Error("STORE_NOT_FOUND");
+
+  // Product must exist
+  const prod = await env.DB.prepare("SELECT upc FROM products WHERE upc = ?")
+    .bind(input.upc)
+    .first<{ upc: string }>();
+  if (!prod) throw new Error("PRODUCT_NOT_FOUND");
+
+  const t = nowSec();
+  const observedAt = input.observed_at ?? t;
+
+  // Basic time sanity: allow small clock skew, but block far-future timestamps
+  if (observedAt > t + 86400) throw new Error("OBSERVED_AT_IN_FUTURE");
+
+  // Dedupe identical spam: same price within 1 hour
+  const dup = await env.DB.prepare(
+    `SELECT id FROM price_snapshots
+     WHERE store_id = ? AND upc = ? AND price_cents = ?
+       AND ABS(observed_at - ?) <= 3600
+     LIMIT 1`
+  )
+    .bind(input.store_id, input.upc, input.price_cents, observedAt)
+    .first<{ id: string }>();
+
+  if (dup?.id) return { snapshot_id: dup.id };
+
+  // Outlier check vs median recent history for this store+UPC
+  const hist = await env.DB.prepare(
+    `SELECT price_cents FROM price_snapshots
+     WHERE store_id = ? AND upc = ?
+     ORDER BY observed_at DESC
+     LIMIT 25`
+  )
+    .bind(input.store_id, input.upc)
+    .all<{ price_cents: number }>();
+
+  const med = median(hist.results.map((r) => r.price_cents));
+  if (med !== null) {
+    if (input.price_cents < Math.floor(med * 0.3) || input.price_cents > Math.ceil(med * 3.0)) {
+      throw new Error("OUTLIER_PRICE");
+    }
+  }
+
+  const confidenceBase = input.evidence_type === "receipt_text" ? 0.6 : 0.45;
+  const confidence = clamp01(confidenceBase);
+
+  const id = crypto.randomUUID();
+
+  await env.DB.prepare(
+    `INSERT INTO price_snapshots (
+      id, store_id, upc, price_cents, currency, observed_at, source, evidence_type,
+      confidence, submitter_session_id, flags_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      id,
+      input.store_id,
+      input.upc,
+      input.price_cents,
+      input.currency,
+      observedAt,
+      "community",
+      input.evidence_type,
+      confidence,
+      input.session_id,
+      null,
+      t
+    )
+    .run();
+
+  return { snapshot_id: id };
 }
 </file>
 
@@ -2722,6 +3138,88 @@ export const CartSetItemRequestSchema = z.object({
 export type CartSetItemRequest = z.infer<typeof CartSetItemRequestSchema>;
 </file>
 
+<file path="packages/shared/src/pricing.ts">
+import { z } from "zod";
+
+export const PriceSourceSchema = z.enum(["open_prices", "community", "kroger"]);
+export type PriceSource = z.infer<typeof PriceSourceSchema>;
+
+export const EvidenceTypeSchema = z.enum(["dataset", "manual", "receipt_text"]);
+export type EvidenceType = z.infer<typeof EvidenceTypeSchema>;
+
+export const FreshnessBucketSchema = z.enum(["fresh", "recent", "stale", "old"]);
+export type FreshnessBucket = z.infer<typeof FreshnessBucketSchema>;
+
+export const MoneySchema = z.object({
+  currency: z.string().min(3).max(8).default("USD"),
+  cents: z.number().int().nonnegative()
+});
+
+export const QuoteLineSchema = z.object({
+  upc: z.string(),
+  quantity: z.number().int().positive(),
+
+  unit_price_cents: z.number().int().nonnegative().nullable().default(null),
+  extended_price_cents: z.number().int().nonnegative().nullable().default(null),
+
+  missing: z.boolean(),
+  observed_at: z.number().int().nonnegative().nullable().default(null),
+  source: PriceSourceSchema.nullable().default(null),
+  evidence_type: EvidenceTypeSchema.nullable().default(null),
+  confidence: z.number().min(0).max(1).nullable().default(null),
+  freshness: FreshnessBucketSchema.nullable().default(null)
+});
+export type QuoteLine = z.infer<typeof QuoteLineSchema>;
+
+export const QuoteStoreSchema = z.object({
+  store_id: z.string(),
+  store_name: z.string(),
+  currency: z.string().default("USD"),
+
+  item_count: z.number().int().nonnegative(),
+  matched_count: z.number().int().nonnegative(),
+  missing_count: z.number().int().nonnegative(),
+  completeness: z.number().min(0).max(1),
+
+  total_cents: z.number().int().nonnegative(),
+  adjusted_total_cents: z.number().int().nonnegative(),
+
+  lines: z.array(QuoteLineSchema)
+});
+export type QuoteStore = z.infer<typeof QuoteStoreSchema>;
+
+export const CartQuoteRequestSchema = z.object({
+  store_ids: z.array(z.string()).min(1).max(20)
+});
+export type CartQuoteRequest = z.infer<typeof CartQuoteRequestSchema>;
+
+export const CartQuoteResponseSchema = z.object({
+  session_id: z.string(),
+  generated_at: z.number().int().nonnegative(),
+  currency: z.string().default("USD"),
+  cheapest_store_id: z.string().nullable().default(null),
+  stores: z.array(QuoteStoreSchema),
+  warnings: z.array(z.string()).default([])
+});
+export type CartQuoteResponse = z.infer<typeof CartQuoteResponseSchema>;
+
+export const PriceSubmitRequestSchema = z.object({
+  store_id: z.string().min(1).max(128),
+  upc: z.string().min(1).max(64),
+  price_cents: z.number().int().min(1).max(1_000_000),
+  currency: z.string().min(3).max(8).optional().default("USD"),
+  observed_at: z.number().int().nonnegative().optional(),
+  evidence_type: EvidenceTypeSchema.optional().default("manual")
+});
+export type PriceSubmitRequest = z.infer<typeof PriceSubmitRequestSchema>;
+
+export const PriceSubmitResponseSchema = z.object({
+  ok: z.literal(true),
+  snapshot_id: z.string()
+});
+export type PriceSubmitResponse = z.infer<typeof PriceSubmitResponseSchema>;
+</file>
+
 <file path="packages/shared/src/product.ts">
 import { z } from "zod";
 
@@ -3024,14 +3522,107 @@ export function cors(allowedOrigin: string): MiddlewareHandler {
 }
 </file>
 
+<file path="apps/api/vite.config.ts">
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+
+// https://vite.dev/config/
+export default defineConfig(async ({ mode }) => {
+  // Vitest runs Vite in "test" mode and sets VITEST in the config process env.
+  const isVitest = !!process.env.VITEST || mode === "test";
+  const plugins = [react()];
+
+  if (!isVitest) {
+    const { cloudflare } = await import("@cloudflare/vite-plugin");
+    plugins.push(cloudflare());
+  }
+
+  return { plugins };
+});
+</file>
+
+<file path="apps/web/.env.example">
+VITE_API_BASE_URL=http://localhost:8787
+VITE_API_BASE_URL=http://localhost:8787/api
+</file>
+
+<file path="apps/web/package.json">
+{
+  "name": "web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@pricecart/shared": "file:../../packages/shared",
+    "leaflet": "1.9.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-leaflet": "5.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/leaflet": "1.9.21",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "eslint": "^9.39.1",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.4.24",
+    "globals": "^16.5.0",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.46.4",
+    "vite": "^7.2.4",
+    "vitest": "^4.0.16"
+  }
+}
+</file>
+
+<file path="package.json">
+{
+  "name": "pricecart",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run -ws --if-present dev",
+    "test": "npm run -ws --if-present test",
+    "lint": "npm run -ws --if-present lint",
+    "typecheck": "npm run -ws --if-present typecheck",
+    "build": "npm run -ws --if-present build"
+  },
+  "dependencies": {
+    "hono": "4.11.3",
+    "zod": "4.2.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20251225.0",
+    "@cloudflare/vite-plugin": "1.19.0",
+    "@types/node": "25.0.3",
+    "miniflare": "4.20251217.0",
+    "vitest": "4.0.16"
+  }
+}
+</file>
+
 <file path="apps/api/src/index.ts">
-import { CartAddItemRequestSchema, CartSetItemRequestSchema } from "@pricecart/shared";
+import { CartAddItemRequestSchema, CartQuoteRequestSchema, CartSetItemRequestSchema, PriceSubmitRequestSchema } from "@pricecart/shared";
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./env";
 import { cors } from "./middleware/cors";
 import { securityHeaders } from "./middleware/security";
 import { addCartItem, clearCart, getCart, removeCartItem, setCartItemQuantity } from "./services/cart";
+import { quoteCart, submitPrice } from "./services/pricing";
 import { productSearch } from "./services/productSearch";
 import { storeSearch } from "./services/storeDiscovery";
 
@@ -3276,33 +3867,89 @@ app.post("/cart/clear", async (c) => {
   }
 });
 
-export default app;
-</file>
+app.post("/cart/quote", async (c) => {
+  try {
+    const session_id = requireSession(c);
+    const body = await c.req.json();
+    const parsed = CartQuoteRequestSchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: "INVALID_INPUT" }, 400);
 
-<file path="apps/api/vite.config.ts">
-import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+    const res = await quoteCart(c.env, { session_id, store_ids: parsed.data.store_ids });
 
-// https://vite.dev/config/
-export default defineConfig(async ({ mode }) => {
-  // Vitest runs Vite in "test" mode and sets VITEST in the config process env.
-  const isVitest = !!process.env.VITEST || mode === "test";
-  const plugins = [react()];
+    console.log(
+      JSON.stringify({
+        level: "info",
+        route: "/cart/quote",
+        session: session_id,
+        store_count: parsed.data.store_ids.length,
+        cheapest_store_id: res.cheapest_store_id,
+        warnings: res.warnings
+      })
+    );
 
-  if (!isVitest) {
-    const { cloudflare } = await import("@cloudflare/vite-plugin");
-    plugins.push(cloudflare());
+    return c.json(res);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
+    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
   }
-
-  return { plugins };
 });
+
+app.post("/prices/submit", async (c) => {
+  try {
+    const session_id = requireSession(c);
+    const body = await c.req.json();
+    const parsed = PriceSubmitRequestSchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: "INVALID_INPUT" }, 400);
+
+    const out = await submitPrice(c.env, {
+      session_id,
+      store_id: parsed.data.store_id,
+      upc: parsed.data.upc,
+      price_cents: parsed.data.price_cents,
+      currency: parsed.data.currency,
+      observed_at: parsed.data.observed_at,
+      evidence_type: parsed.data.evidence_type
+    });
+
+    console.log(
+      JSON.stringify({
+        level: "info",
+        route: "/prices/submit",
+        session: session_id,
+        store_id: parsed.data.store_id,
+        upc: parsed.data.upc,
+        price_cents: parsed.data.price_cents,
+        snapshot_id: out.snapshot_id
+      })
+    );
+
+    return c.json({ ok: true, snapshot_id: out.snapshot_id });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
+    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
+    if (msg === "STORE_NOT_FOUND") return c.json({ error: "STORE_NOT_FOUND" }, 404);
+    if (msg === "PRODUCT_NOT_FOUND") return c.json({ error: "PRODUCT_NOT_FOUND" }, 404);
+    if (msg === "OUTLIER_PRICE") return c.json({ error: "OUTLIER_PRICE" }, 422);
+    if (msg === "OBSERVED_AT_IN_FUTURE") return c.json({ error: "OBSERVED_AT_IN_FUTURE" }, 400);
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+export default app;
 </file>
 
 <file path="apps/web/src/lib/api.ts">
 import type {
   Cart,
   CartAddItemRequest,
+  CartQuoteRequest,
+  CartQuoteResponse,
   CartSetItemRequest,
+  PriceSubmitRequest,
+  PriceSubmitResponse,
   ProductLookupResponse,
   ProductSearchResponse,
   StoreSearchResponse
@@ -3392,14 +4039,26 @@ export async function clearCart(): Promise<Cart> {
   const url = new URL(base + "/cart/clear");
   return fetchJson<Cart>(url.toString(), { method: "POST", json: {} });
 }
+
+export async function quoteCart(req: CartQuoteRequest): Promise<CartQuoteResponse> {
+  const base = apiBase();
+  const url = new URL(base + "/cart/quote");
+  return fetchJson<CartQuoteResponse>(url.toString(), { method: "POST", json: req });
+}
+
+export async function submitPrice(req: PriceSubmitRequest): Promise<PriceSubmitResponse> {
+  const base = apiBase();
+  const url = new URL(base + "/prices/submit");
+  return fetchJson<PriceSubmitResponse>(url.toString(), { method: "POST", json: req });
+}
 </file>
 
 <file path="apps/web/src/App.tsx">
-import type { Product, ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
+import type { CartQuoteResponse, Product, ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
 import "leaflet/dist/leaflet.css";
 import { useMemo, useState } from "react";
 import { MapContainer, Marker, Popup, TileLayer } from "react-leaflet";
-import { fetchStores, lookupProductByUpc, searchProducts } from "./lib/api";
+import { fetchStores, lookupProductByUpc, quoteCart, searchProducts, submitPrice } from "./lib/api";
 import { useCart } from "./lib/cart";
 
 function formatErrorMessage(err: unknown) {
@@ -3432,6 +4091,12 @@ export default function App() {
 
   // Phase 3: Cart
   const cart = useCart();
+  const [quote, setQuote] = useState<CartQuoteResponse | null>(null);
+  const [quoteStatus, setQuoteStatus] = useState<string>("");
+  const [submitStoreId, setSubmitStoreId] = useState<string>("");
+  const [submitUpc, setSubmitUpc] = useState<string>("");
+  const [submitPriceCents, setSubmitPriceCents] = useState<number>(0);
+  const [submitStatus, setSubmitStatus] = useState<string>("");
 
   const mapCenter = useMemo(() => {
     const first = stores?.stores?.[0];
@@ -3477,6 +4142,45 @@ export default function App() {
   async function addProductToCart(p: Product) {
     await cart.add(p.upc, 1);
     setView("cart");
+  }
+
+  async function onComparePrices() {
+    setQuoteStatus("Loading...");
+    setQuote(null);
+
+    try {
+      const storeIds = (stores?.stores ?? []).slice(0, 3).map((s) => s.id);
+      if (storeIds.length === 0) {
+        setQuoteStatus("Search stores first (Phase 1). Then compare.");
+        return;
+      }
+
+      const res = await quoteCart({ store_ids: storeIds });
+      setQuote(res);
+      setQuoteStatus("");
+
+      // helpful default for submission UI
+      setSubmitStoreId(storeIds[0] ?? "");
+    } catch (err) {
+      setQuoteStatus(formatErrorMessage(err));
+    }
+  }
+
+  async function onSubmitPrice() {
+    setSubmitStatus("Submitting...");
+    try {
+      await submitPrice({
+        store_id: submitStoreId,
+        upc: submitUpc.trim(),
+        price_cents: submitPriceCents,
+        currency: "USD",
+        evidence_type: "manual"
+      });
+
+      setSubmitStatus("Saved. Re-run compare to see updates.");
+    } catch (err) {
+      setSubmitStatus(formatErrorMessage(err));
+    }
   }
 
   return (
@@ -3665,8 +4369,80 @@ export default function App() {
 
               <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
                 <button onClick={cart.clear}>Clear cart</button>
-                <button onClick={() => alert("Phase 4: Compare prices (quote endpoint)")}>Compare prices</button>
+                <button onClick={onComparePrices}>Compare prices</button>
               </div>
+
+              {quoteStatus && <p>{quoteStatus}</p>}
+
+              {quote && (
+                <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
+                  <h4 style={{ marginTop: 0 }}>Price comparison</h4>
+
+                  {quote.cheapest_store_id ? (
+                    <p>
+                      Cheapest (by completeness, then adjusted total): <b>{quote.cheapest_store_id}</b>
+                    </p>
+                  ) : null}
+
+                  {quote.warnings?.length ? (
+                    <p style={{ opacity: 0.8 }}>
+                      Warnings: {quote.warnings.join(", ")}
+                    </p>
+                  ) : null}
+
+                  <ul style={{ display: "grid", gap: 12, paddingLeft: 16 }}>
+                    {[...quote.stores]
+                      .sort((a, b) => a.adjusted_total_cents - b.adjusted_total_cents)
+                      .map((s) => (
+                        <li key={s.store_id}>
+                          <b>{s.store_name}</b> ({s.store_id})
+                          <div>
+                            Total: <b>${(s.total_cents / 100).toFixed(2)}</b> | Missing: <b>{s.missing_count}</b> | Completeness:{" "}
+                            <b>{Math.round(s.completeness * 100)}%</b>
+                          </div>
+                          <div style={{ opacity: 0.8 }}>
+                            Adjusted total: <b>${(s.adjusted_total_cents / 100).toFixed(2)}</b>
+                          </div>
+                        </li>
+                      ))}
+                  </ul>
+
+                  <hr />
+
+                  <h4>Submit a missing price (manual)</h4>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                    <label>
+                      Store
+                      <select value={submitStoreId} onChange={(e) => setSubmitStoreId(e.target.value)} style={{ marginLeft: 8 }}>
+                        {(stores?.stores ?? []).slice(0, 10).map((s) => (
+                          <option key={s.id} value={s.id}>
+                            {s.name} ({s.id})
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label>
+                      UPC
+                      <input value={submitUpc} onChange={(e) => setSubmitUpc(e.target.value)} style={{ marginLeft: 8, width: 160 }} />
+                    </label>
+
+                    <label>
+                      Price (cents)
+                      <input
+                        type="number"
+                        value={submitPriceCents}
+                        onChange={(e) => setSubmitPriceCents(Number(e.target.value))}
+                        style={{ marginLeft: 8, width: 120 }}
+                      />
+                    </label>
+
+                    <button onClick={onSubmitPrice}>Submit</button>
+                  </div>
+
+                  {submitStatus && <p>{submitStatus}</p>}
+                </div>
+              )}
             </>
           )}
         </section>
@@ -3682,83 +4458,11 @@ export default function App() {
 }
 </file>
 
-<file path="apps/web/.env.example">
-VITE_API_BASE_URL=http://localhost:8787
-VITE_API_BASE_URL=http://localhost:8787/api
-</file>
-
-<file path="apps/web/package.json">
-{
-  "name": "web",
-  "private": true,
-  "version": "0.0.0",
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
-    "lint": "eslint .",
-    "preview": "vite preview",
-    "test": "vitest run"
-  },
-  "dependencies": {
-    "@pricecart/shared": "file:../../packages/shared",
-    "leaflet": "1.9.4",
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "react-leaflet": "5.0.0"
-  },
-  "devDependencies": {
-    "@eslint/js": "^9.39.1",
-    "@types/leaflet": "1.9.21",
-    "@types/node": "^24.10.1",
-    "@types/react": "^19.2.5",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^5.1.1",
-    "eslint": "^9.39.1",
-    "eslint-plugin-react-hooks": "^7.0.1",
-    "eslint-plugin-react-refresh": "^0.4.24",
-    "globals": "^16.5.0",
-    "typescript": "~5.9.3",
-    "typescript-eslint": "^8.46.4",
-    "vite": "^7.2.4",
-    "vitest": "^4.0.16"
-  }
-}
-</file>
-
 <file path="packages/shared/src/index.ts">
 export * from "./cart.js";
+export * from "./pricing.js";
 export * from "./product.js";
 export * from "./store.js";
-</file>
-
-<file path="package.json">
-{
-  "name": "pricecart",
-  "private": true,
-  "workspaces": [
-    "apps/*",
-    "packages/*"
-  ],
-  "scripts": {
-    "dev": "npm run -ws --if-present dev",
-    "test": "npm run -ws --if-present test",
-    "lint": "npm run -ws --if-present lint",
-    "typecheck": "npm run -ws --if-present typecheck",
-    "build": "npm run -ws --if-present build"
-  },
-  "dependencies": {
-    "hono": "4.11.3",
-    "zod": "4.2.1"
-  },
-  "devDependencies": {
-    "@cloudflare/workers-types": "4.20251225.0",
-    "@cloudflare/vite-plugin": "1.19.0",
-    "@types/node": "25.0.3",
-    "miniflare": "4.20251217.0",
-    "vitest": "4.0.16"
-  }
-}
 </file>
 
 </files>

@@ -1,0 +1,10 @@
+{
+  "data": [
+    {
+      "locationId": "12345",
+      "name": "Kroger - Demo Location",
+      "chain": "Kroger",
+      "geolocation": { "latitude": 40.75, "longitude": -73.99 }
+    }
+  ]
+}

@@ -1,15 +1,26 @@
 import type { CartQuoteResponse, EvidenceType, FreshnessBucket, PriceSource } from "@pricecart/shared";
 import { takeToken } from "../lib/rateLimit";
 import { nowSec } from "../lib/time";
+import { getKrogerLivePriceOverlay } from "./krogerLivePrices";
 
-type EnvLike = { DB: D1Database };
+type EnvLike = {
+  DB: D1Database;
+  OUTBOUND_USER_AGENT?: string;
+  OUTBOUND_REFERER?: string;
+
+  KROGER_LIVE_PRICES_ENABLED?: string;
+  KROGER_CLIENT_ID?: string;
+  KROGER_CLIENT_SECRET?: string;
+  KROGER_BASE_URL?: string;
+  KROGER_TOKEN_URL?: string;
+};
 
 const RL_QUOTE = { capacity: 60, refillPerSec: 1 / 2, cost: 1 };   // ~60/min/session
 const RL_SUBMIT = { capacity: 20, refillPerSec: 1 / 60, cost: 1 }; // ~20/min/session
 
 type CartItemRow = { upc: string; quantity: number };
 
-type StoreRow = { id: string; name: string };
+type StoreRow = { id: string; name: string; lat: number; lon: number; tags_json: string | null };
 
 type PriceRow = {
   upc: string;
@@ -82,7 +93,7 @@ export async function quoteCart(
   // Load store names
   const storePlaceholders = storeIds.map(() => "?").join(",");
   const storeRows = await env.DB.prepare(
-    `SELECT id, name FROM stores WHERE id IN (${storePlaceholders})`
+    `SELECT id, name, lat, lon, tags_json FROM stores WHERE id IN (${storePlaceholders})`
   )
     .bind(...storeIds)
     .all<StoreRow>();
@@ -119,7 +130,35 @@ export async function quoteCart(
         .all<PriceRow>();
 
       for (const r of rows.results) priceMap.set(r.upc, r);
+
+      
     }
+    
+    // Optional live-price overlay (Phase 5). Default off via env flag.
+    const overlay = await getKrogerLivePriceOverlay(env, {
+      session_id: input.session_id,
+      store: { id: store_id, name: store.name, lat: store.lat, lon: store.lon, tags: store.tags_json ? JSON.parse(store.tags_json) : {} },
+      upcs,
+      t
+    });
+    if (overlay.warnings.length) warnings.push(...overlay.warnings);
+
+    // Overwrite snapshot prices with live prices when available
+    if (overlay.prices_by_upc.size) {
+      for (const [upc, live] of overlay.prices_by_upc) {
+        priceMap.set(upc, {
+          upc,
+          price_cents: live.price_cents,
+          currency: "USD",
+          observed_at: live.observed_at,
+          source: "kroger",
+          evidence_type: "dataset",
+          confidence: live.confidence
+        });
+      }
+    }
+
+
 
     let total = 0;
     let matched = 0;
