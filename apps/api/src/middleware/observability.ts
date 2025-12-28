@@ -1,14 +1,17 @@
-import type { MiddlewareHandler } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import { routePath } from "hono/route";
 import { parseSampleRate, recordRouteMetric } from "../lib/metrics";
+import type { Env } from "../env";
 
-function getOrCreateRequestId(c: any) {
+type ApiContext = Context<{ Bindings: Env }>;
+
+function getOrCreateRequestId(c: ApiContext) {
   const incoming = c.req.header("x-request-id") || c.req.header("x-requestid");
   const cfRay = c.req.header("cf-ray");
   return incoming || cfRay || crypto.randomUUID();
 }
 
-export const observabilityMiddleware: MiddlewareHandler = async (c, next) => {
+export const observabilityMiddleware: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
   const requestId = getOrCreateRequestId(c);
   c.set("request_id", requestId);
 

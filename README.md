@@ -11,9 +11,9 @@ PriceCart is a Proof-of-Concept for comparing grocery pricing across stores. The
 1. `npm ci` (installs all workspaces)
 2. Start the API (runs against your local D1 and Cloudflare bindings):
    ```bash
-   cd apps/api
-   npx wrangler dev --local
+   npm run dev:api
    ```
+   This helper builds the worker via `vite` before invoking `wrangler dev --local`, ensuring the `/api/internal/*` routes are available in every session. If you prefer to launch manually, run `cd apps/api && npx vite build` before `npx wrangler dev --local`.
 3. Start the web UI:
    ```bash
    cd apps/web

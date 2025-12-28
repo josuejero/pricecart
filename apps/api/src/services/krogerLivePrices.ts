@@ -144,7 +144,7 @@ async function upsertLocationId(
 function pickBestLocation(store: LivePriceOverlayInput["store"], locations: KrogerLocation[]) {
   let best: { location: KrogerLocation; dist_m: number } | null = null;
   for (const loc of locations) {
-    const d = distanceMeters(store.lat, store.lon, loc.lat, loc.lon);
+    const d = distanceMeters(store, loc);
     if (!best || d < best.dist_m) best = { location: loc, dist_m: d };
   }
   return best;

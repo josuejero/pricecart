@@ -1,13 +1,17 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { estimateP95FromBuckets } from "../lib/metrics";
+import type { Env } from "../env";
 
-function requireInternal(c: any) {
+type InternalContext = Context<{ Bindings: Env }>;
+
+function requireInternal(c: InternalContext) {
   const token = c.env.INTERNAL_TOKEN;
   const got = c.req.header("x-pricecart-internal");
   return token && got && got === token;
 }
 
-function errorResponse(c: any, code: string, message: string, status: number) {
+function errorResponse(c: InternalContext, code: string, message: string, status: number) {
   const requestId = c.get?.("request_id");
   return c.json(
     {
@@ -21,7 +25,7 @@ function errorResponse(c: any, code: string, message: string, status: number) {
   );
 }
 
-export const internalRoutes = new Hono();
+export const internalRoutes = new Hono<{ Bindings: Env }>();
 
 internalRoutes.use("*", async (c, next) => {
   if (!requireInternal(c)) {
@@ -107,7 +111,22 @@ internalRoutes.get("/metrics", async (c) => {
     .bind(minBucket)
     .all();
 
-  const routes = (routeRows.results as any[]).map((row) => {
+  type RouteMetricsRow = {
+    route: string;
+    method: string;
+    status_class: number | string | null;
+    count: number | string | null;
+    sum_ms: number | string | null;
+    max_ms: number | string | null;
+    b_50: number | string | null;
+    b_100: number | string | null;
+    b_250: number | string | null;
+    b_500: number | string | null;
+    b_1000: number | string | null;
+    b_inf: number | string | null;
+  };
+
+  const routes = (routeRows.results as RouteMetricsRow[]).map((row) => {
     const total = Number(row.count || 0);
     const p95 = estimateP95FromBuckets(total, {
       b_50: Number(row.b_50 || 0),

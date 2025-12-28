@@ -10,16 +10,19 @@
     "test": "npm run -ws --if-present test",
     "lint": "npm run -ws --if-present lint",
     "typecheck": "npm run -ws --if-present typecheck",
-    "build": "npm run -ws --if-present build"
+    "build": "npm run -ws --if-present build",
+    "dev:api": "cd apps/api && npx vite build && npx wrangler dev --local"
   },
   "dependencies": {
     "hono": "4.11.3",
     "zod": "4.2.1"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "4.20251225.0",
     "@cloudflare/vite-plugin": "1.19.0",
+    "@cloudflare/workers-types": "4.20251225.0",
     "@types/node": "25.0.3",
+    "eslint-plugin-react-hooks": "7.0.1",
+    "eslint-plugin-react-refresh": "0.4.26",
     "miniflare": "4.20251217.0",
     "vitest": "4.0.16"
   }

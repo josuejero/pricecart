@@ -12,22 +12,42 @@ import type {
 } from "@pricecart/shared";
 import { getSessionId } from "./session";
 
-type FetchJsonInit = Omit<RequestInit, "body"> & { json?: unknown };
+type FetchJsonInit = Omit<RequestInit, "body"> & { json?: unknown; body?: BodyInit };
 
 function apiBase(): string {
   // Recommended dev value: http://localhost:8787/api
-  return (import.meta as any).env?.VITE_API_BASE_URL ?? "http://localhost:8787/api";
+  return import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8787/api";
 }
 
 export class ApiError extends Error {
-  constructor(
-    public readonly code: string,
-    public readonly requestId: string | null,
-    message: string
-  ) {
+  public readonly code: string;
+  public readonly requestId: string | null;
+
+  constructor(code: string, requestId: string | null, message: string) {
     super(message);
     this.name = "ApiError";
+    this.code = code;
+    this.requestId = requestId;
   }
+}
+
+type ApiErrorPayload = {
+  code?: string;
+  message?: string;
+  request_id?: string;
+};
+
+function extractApiErrorPayload(value: unknown): ApiErrorPayload | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+
+  const { error } = value as { error?: ApiErrorPayload };
+  if (typeof error !== "object" || error === null) {
+    return null;
+  }
+
+  return error;
 }
 
 function newRequestId() {
@@ -36,18 +56,17 @@ function newRequestId() {
 
 async function apiFetch<T>(url: string, init: FetchJsonInit = {}) {
   const requestId = newRequestId();
+  const { json, body: providedBody, ...rest } = init;
   const headers = new Headers(init.headers);
   headers.set("x-pricecart-session", getSessionId());
   headers.set("x-request-id", requestId);
 
-  if (init.json !== undefined) {
+  if (json !== undefined) {
     headers.set("content-type", "application/json");
   }
 
-  const body: BodyInit | undefined =
-    init.json !== undefined ? JSON.stringify(init.json) : init.body;
+  const body: BodyInit | undefined = json !== undefined ? JSON.stringify(json) : providedBody;
 
-  const { json: _unused, ...rest } = init;
   const res = await fetch(url, { ...rest, headers, body });
 
   const text = await res.text();
@@ -63,8 +82,7 @@ async function apiFetch<T>(url: string, init: FetchJsonInit = {}) {
   const serverRequestId = res.headers.get("x-request-id") || requestId;
 
   if (!res.ok) {
-    const errorPayload =
-      parsed && typeof parsed === "object" && "error" in parsed ? (parsed as any).error : null;
+    const errorPayload = extractApiErrorPayload(parsed);
     const code = (errorPayload?.code as string) ?? `HTTP_${res.status}`;
     const message =
       (errorPayload?.message as string) ??

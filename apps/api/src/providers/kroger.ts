@@ -6,8 +6,8 @@ import { noteProviderOutcome } from "../lib/providerMetrics";
 const PROVIDER = "kroger";
 
 function b64(s: string) {
-  const g: any = globalThis as any;
-  if (typeof g.btoa === "function") return g.btoa(s);
+  const globalScope = globalThis as typeof globalThis & { btoa?: (input: string) => string };
+  if (typeof globalScope.btoa === "function") return globalScope.btoa(s);
   return Buffer.from(s, "utf8").toString("base64");
 }
 

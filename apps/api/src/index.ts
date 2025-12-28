@@ -1,5 +1,6 @@
 import { CartAddItemRequestSchema, CartQuoteRequestSchema, CartSetItemRequestSchema, PriceSubmitRequestSchema } from "@pricecart/shared";
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { z } from "zod";
 import type { Env } from "./env";
 import { cors } from "./middleware/cors";
@@ -12,6 +13,7 @@ import { productSearch } from "./services/productSearch";
 import { storeSearch } from "./services/storeDiscovery";
 
 const app = new Hono<{ Bindings: Env }>();
+type ApiContext = Context<{ Bindings: Env }>;
 
 // Adjust to your Pages domain once known
 const ALLOWED_ORIGIN = "http://localhost:5173";
@@ -20,7 +22,7 @@ app.use("*", observabilityMiddleware);
 app.use("*", securityHeaders());
 app.use("*", cors(ALLOWED_ORIGIN));
 
-function buildErrorPayload(c: any, code: string, message?: string, details?: unknown) {
+function buildErrorPayload(c: ApiContext, code: string, message?: string, details?: unknown) {
   const error: Record<string, unknown> = {
     code,
     message: message ?? code,
@@ -34,14 +36,14 @@ function buildErrorPayload(c: any, code: string, message?: string, details?: unk
   return { error };
 }
 
-function respondError(c: any, code: string, status: number, message?: string, details?: unknown) {
+function respondError(c: ApiContext, code: string, status: number, message?: string, details?: unknown) {
   return c.json(buildErrorPayload(c, code, message, details), status);
 }
 
 app.get("/health", (c) => c.json({ ok: true }));
 const SessionIdSchema = z.string().min(1).max(128);
 
-function requireSession(c: any): string {
+function requireSession(c: ApiContext): string {
   const raw = c.req.header("x-pricecart-session");
   const parsed = SessionIdSchema.safeParse(raw);
   if (!parsed.success) throw new Error("MISSING_SESSION");

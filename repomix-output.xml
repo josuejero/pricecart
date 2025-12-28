@@ -51,17 +51,22 @@ apps/
       0006_phase4_pricing.sql
       0007_phase4_seed_prices.sql
       0008_phase5_kroger_live_prices.sql
+      0009_phase6_observability.sql
     src/
       lib/
         cache.ts
         circuitBreaker.ts
         geo.ts
         hash.ts
+        http.ts
+        metrics.ts
+        providerMetrics.ts
         rateLimit.test.ts
         rateLimit.ts
         time.ts
       middleware/
         cors.ts
+        observability.ts
         security.ts
       providers/
         __fixtures__/
@@ -77,6 +82,8 @@ apps/
         openFoodFacts.contract.test.ts
         openFoodFacts.ts
         overpass.ts
+      routes/
+        internal.ts
       services/
         cart.ts
         krogerLivePrices.ts
@@ -110,6 +117,8 @@ apps/
     wrangler.toml
   web/
     src/
+      components/
+        AttributionFooter.tsx
       lib/
         api.ts
         cart.ts
@@ -143,6 +152,7 @@ packages/
 .gitignore
 .repomixignore
 package.json
+README.md
 </directory_structure>
 
 <files>
@@ -379,6 +389,49 @@ CREATE INDEX IF NOT EXISTS idx_store_provider_mappings_verified
   ON store_provider_mappings(provider, verified_at);
 </file>
 
+<file path="apps/api/migrations/0009_phase6_observability.sql">
+-- Phase 6: observability + metrics tables
+
+-- Route-level metrics (minute buckets + latency histogram)
+CREATE TABLE IF NOT EXISTS route_metrics (
+  day TEXT NOT NULL,
+  minute_bucket INTEGER NOT NULL,
+  route TEXT NOT NULL,
+  method TEXT NOT NULL,
+  status_class INTEGER NOT NULL,
+
+  count INTEGER NOT NULL DEFAULT 0,
+  sum_ms INTEGER NOT NULL DEFAULT 0,
+  max_ms INTEGER NOT NULL DEFAULT 0,
+
+  b_50  INTEGER NOT NULL DEFAULT 0,
+  b_100 INTEGER NOT NULL DEFAULT 0,
+  b_250 INTEGER NOT NULL DEFAULT 0,
+  b_500 INTEGER NOT NULL DEFAULT 0,
+  b_1000 INTEGER NOT NULL DEFAULT 0,
+  b_inf INTEGER NOT NULL DEFAULT 0,
+
+  PRIMARY KEY (day, minute_bucket, route, method, status_class)
+);
+
+CREATE INDEX IF NOT EXISTS idx_route_metrics_recent
+  ON route_metrics(day, minute_bucket);
+
+-- Provider failure counters (minute buckets)
+CREATE TABLE IF NOT EXISTS provider_metrics (
+  day TEXT NOT NULL,
+  minute_bucket INTEGER NOT NULL,
+  provider TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+
+  PRIMARY KEY (day, minute_bucket, provider, outcome)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_metrics_recent
+  ON provider_metrics(day, minute_bucket);
+</file>
+
 <file path="apps/api/src/lib/cache.ts">
 import { nowSec } from "./time";
 
@@ -512,6 +565,273 @@ export async function sha256Base64Url(input: string): Promise<string> {
 }
 </file>
 
+<file path="apps/api/src/lib/http.ts">
+export type RetryOptions = {
+  attempts: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  retryOnStatuses: number[];
+};
+
+export class HttpError extends Error {
+  constructor(message: string, public readonly status: number, public readonly url: string) {
+    super(message);
+  }
+}
+
+export class TimeoutError extends Error {
+  constructor(message: string, public readonly timeoutMs: number) {
+    super(message);
+  }
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function jitter(ms: number) {
+  const delta = ms * 0.2;
+  return Math.max(0, ms + (Math.random() * 2 - 1) * delta);
+}
+
+function parseRetryAfterSeconds(value: string | null): number | null {
+  if (!value) return null;
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
+}
+
+export async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (err: any) {
+    if (err?.name === "AbortError") {
+      throw new TimeoutError(`Request timed out after ${timeoutMs}ms`, timeoutMs);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function toUrlString(input: RequestInfo | URL) {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.toString();
+  return String(input);
+}
+
+export async function fetchWithRetry(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  opts: {
+    timeoutMs: number;
+    retry: RetryOptions;
+    isIdempotent?: boolean;
+    onAttemptError?: (error: unknown, attempt: number) => void;
+  }
+): Promise<Response> {
+  const method = (init.method || "GET").toUpperCase();
+  const isIdempotent =
+    opts.isIdempotent ?? (method === "GET" || method === "HEAD");
+
+  const { attempts, baseDelayMs, maxDelayMs, retryOnStatuses } = opts.retry;
+  const totalAttempts = Math.max(1, attempts);
+
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+    try {
+      const response = await fetchWithTimeout(input, init, opts.timeoutMs);
+
+      if (!isIdempotent || !retryOnStatuses.includes(response.status)) {
+        return response;
+      }
+
+      if (attempt >= totalAttempts) {
+        throw new HttpError(`Upstream returned ${response.status}`, response.status, toUrlString(input));
+      }
+
+      const retryAfter = parseRetryAfterSeconds(response.headers.get("Retry-After"));
+      const delay = retryAfter != null
+        ? Math.min(maxDelayMs, retryAfter * 1000)
+        : Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1));
+      await sleep(jitter(delay));
+    } catch (error) {
+      lastError = error;
+      opts.onAttemptError?.(error, attempt);
+
+      if (!isIdempotent) break;
+      if (attempt >= totalAttempts) break;
+
+      const delay = Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1));
+      await sleep(jitter(delay));
+    }
+  }
+
+  throw lastError ?? new Error("Request failed");
+}
+</file>
+
+<file path="apps/api/src/lib/metrics.ts">
+type BucketCounts = {
+  b_50: number;
+  b_100: number;
+  b_250: number;
+  b_500: number;
+  b_1000: number;
+  b_inf: number;
+};
+
+export function getMinuteBucket(now = Date.now()) {
+  return Math.floor(now / 60000);
+}
+
+export function getDayString(now = Date.now()) {
+  return new Date(now).toISOString().slice(0, 10);
+}
+
+export function bucketLatency(ms: number): BucketCounts {
+  return {
+    b_50: ms <= 50 ? 1 : 0,
+    b_100: ms > 50 && ms <= 100 ? 1 : 0,
+    b_250: ms > 100 && ms <= 250 ? 1 : 0,
+    b_500: ms > 250 && ms <= 500 ? 1 : 0,
+    b_1000: ms > 500 && ms <= 1000 ? 1 : 0,
+    b_inf: ms > 1000 ? 1 : 0
+  };
+}
+
+export function parseSampleRate(v: string | undefined, fallback = 1) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(1, Math.max(0, n));
+}
+
+export async function recordRouteMetric(args: {
+  db: D1Database;
+  enabled: boolean;
+  sampleRate: number;
+  route: string;
+  method: string;
+  status: number;
+  latencyMs: number;
+}) {
+  if (!args.enabled) return;
+  if (args.sampleRate < 1 && Math.random() > args.sampleRate) return;
+
+  const day = getDayString();
+  const minute_bucket = getMinuteBucket();
+  const status_class = args.status >= 500 ? 5 : args.status >= 400 ? 4 : 2;
+  const buckets = bucketLatency(args.latencyMs);
+
+  const stmt = args.db
+    .prepare(
+      `INSERT INTO route_metrics (
+        day, minute_bucket, route, method, status_class,
+        count, sum_ms, max_ms,
+        b_50, b_100, b_250, b_500, b_1000, b_inf
+      ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(day, minute_bucket, route, method, status_class)
+      DO UPDATE SET
+        count = count + excluded.count,
+        sum_ms = sum_ms + excluded.sum_ms,
+        max_ms = MAX(max_ms, excluded.max_ms),
+        b_50 = b_50 + excluded.b_50,
+        b_100 = b_100 + excluded.b_100,
+        b_250 = b_250 + excluded.b_250,
+        b_500 = b_500 + excluded.b_500,
+        b_1000 = b_1000 + excluded.b_1000,
+        b_inf = b_inf + excluded.b_inf`
+    )
+    .bind(
+      day,
+      minute_bucket,
+      args.route,
+      args.method,
+      status_class,
+      args.latencyMs,
+      args.latencyMs,
+      buckets.b_50,
+      buckets.b_100,
+      buckets.b_250,
+      buckets.b_500,
+      buckets.b_1000,
+      buckets.b_inf
+    );
+
+  await stmt.run();
+}
+
+export async function recordProviderMetric(args: {
+  db: D1Database;
+  enabled: boolean;
+  provider: string;
+  outcome: string;
+}) {
+  if (!args.enabled) return;
+
+  const day = getDayString();
+  const minute_bucket = getMinuteBucket();
+
+  const stmt = args.db
+    .prepare(
+      `INSERT INTO provider_metrics (day, minute_bucket, provider, outcome, count)
+       VALUES (?, ?, ?, ?, 1)
+       ON CONFLICT(day, minute_bucket, provider, outcome)
+       DO UPDATE SET count = count + 1`
+    )
+    .bind(day, minute_bucket, args.provider, args.outcome);
+
+  await stmt.run();
+}
+
+export function estimateP95FromBuckets(total: number, buckets: BucketCounts) {
+  if (total <= 0) return null;
+  const target = Math.ceil(total * 0.95);
+  const ordered: Array<[number, number]> = [
+    [50, buckets.b_50],
+    [100, buckets.b_100],
+    [250, buckets.b_250],
+    [500, buckets.b_500],
+    [1000, buckets.b_1000],
+    [Infinity, buckets.b_inf]
+  ];
+  let cumulative = 0;
+  for (const [upper, count] of ordered) {
+    cumulative += count;
+    if (cumulative >= target) return upper;
+  }
+  return Infinity;
+}
+</file>
+
+<file path="apps/api/src/lib/providerMetrics.ts">
+import { recordProviderMetric } from "./metrics";
+
+export async function noteProviderOutcome(args: {
+  db: D1Database;
+  enabled: boolean;
+  provider: string;
+  outcome: string;
+}) {
+  try {
+    await recordProviderMetric({
+      db: args.db,
+      enabled: args.enabled,
+      provider: args.provider,
+      outcome: args.outcome
+    });
+  } catch {
+    // Metrics failures should never block the request.
+  }
+}
+</file>
+
 <file path="apps/api/src/lib/rateLimit.test.ts">
 import { describe, expect, it } from "vitest";
 import { takeToken } from "./rateLimit";
@@ -598,6 +918,63 @@ export async function takeToken(
 
 <file path="apps/api/src/lib/time.ts">
 export const nowSec = () => Math.floor(Date.now() / 1000);
+</file>
+
+<file path="apps/api/src/middleware/observability.ts">
+import type { MiddlewareHandler } from "hono";
+import { routePath } from "hono/route";
+import { parseSampleRate, recordRouteMetric } from "../lib/metrics";
+
+function getOrCreateRequestId(c: any) {
+  const incoming = c.req.header("x-request-id") || c.req.header("x-requestid");
+  const cfRay = c.req.header("cf-ray");
+  return incoming || cfRay || crypto.randomUUID();
+}
+
+export const observabilityMiddleware: MiddlewareHandler = async (c, next) => {
+  const requestId = getOrCreateRequestId(c);
+  c.set("request_id", requestId);
+
+  const start = Date.now();
+
+  try {
+    await next();
+  } finally {
+    const latencyMs = Date.now() - start;
+    const status = c.res?.status ?? 500;
+
+    c.header("x-request-id", requestId);
+
+    const route = routePath(c) || c.req.path;
+
+    console.log(
+      JSON.stringify({
+        level: "info",
+        ts: new Date().toISOString(),
+        request_id: requestId,
+        method: c.req.method,
+        route,
+        status,
+        latency_ms: latencyMs
+      })
+    );
+
+    const enabled = c.env.METRICS_ENABLED === "1";
+    const sampleRate = parseSampleRate(c.env.METRICS_SAMPLE_RATE, 1);
+
+    c.executionCtx?.waitUntil(
+      recordRouteMetric({
+        db: c.env.DB,
+        enabled,
+        sampleRate,
+        route,
+        method: c.req.method,
+        status,
+        latencyMs
+      }).catch(() => {})
+    );
+  }
+};
 </file>
 
 <file path="apps/api/src/middleware/security.ts">
@@ -722,345 +1099,6 @@ describe("Kroger provider (contract)", () => {
 });
 </file>
 
-<file path="apps/api/src/providers/kroger.ts">
-import { z } from "zod";
-import { isOpen, recordFailure, recordSuccess } from "../lib/circuitBreaker";
-
-const PROVIDER = "kroger";
-
-function b64(s: string) {
-  const g: any = globalThis as any;
-  if (typeof g.btoa === "function") return g.btoa(s);
-  return Buffer.from(s, "utf8").toString("base64");
-}
-
-function toNumber(v: unknown): number | null {
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  if (typeof v === "string") {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
-  }
-  return null;
-}
-
-function toCents(v: unknown): number | null {
-  const n = toNumber(v);
-  if (n === null) return null;
-  return Math.round(n * 100);
-}
-
-/** ---------------- Token ---------------- */
-const TokenResponseSchema = z
-  .object({
-    access_token: z.string(),
-    token_type: z.string().optional(),
-    expires_in: z.union([z.number(), z.string()]).optional(),
-    scope: z.string().optional()
-  })
-  .passthrough();
-
-export type KrogerToken = {
-  access_token: string;
-  expires_in_sec: number | null;
-  scope: string | null;
-};
-
-export function parseKrogerTokenResponse(json: unknown): KrogerToken {
-  const r = TokenResponseSchema.parse(json);
-  const exp = toNumber(r.expires_in);
-  return {
-    access_token: r.access_token,
-    expires_in_sec: exp === null ? null : Math.floor(exp),
-    scope: r.scope ?? null
-  };
-}
-
-/** ---------------- Locations ---------------- */
-const KrogerLocationSchema = z
-  .object({
-    locationId: z.string(),
-    name: z.string().optional().nullable(),
-    chain: z.string().optional().nullable(),
-    geolocation: z
-      .object({
-        latitude: z.union([z.number(), z.string()]).optional(),
-        longitude: z.union([z.number(), z.string()]).optional()
-      })
-      .optional()
-      .nullable(),
-    latitude: z.union([z.number(), z.string()]).optional(),
-    longitude: z.union([z.number(), z.string()]).optional()
-  })
-  .passthrough();
-
-const KrogerLocationsResponseSchema = z
-  .object({
-    data: z.array(KrogerLocationSchema).default([])
-  })
-  .passthrough();
-
-export type KrogerLocation = {
-  locationId: string;
-  name: string | null;
-  chain: string | null;
-  lat: number;
-  lon: number;
-};
-
-export function parseKrogerLocationsResponse(json: unknown): KrogerLocation[] {
-  const r = KrogerLocationsResponseSchema.parse(json);
-  const out: KrogerLocation[] = [];
-
-  for (const loc of r.data) {
-    const lat =
-      toNumber(loc.geolocation?.latitude) ??
-      toNumber(loc.latitude) ??
-      null;
-    const lon =
-      toNumber(loc.geolocation?.longitude) ??
-      toNumber(loc.longitude) ??
-      null;
-
-    if (lat === null || lon === null) continue;
-
-    out.push({
-      locationId: loc.locationId,
-      name: loc.name ?? null,
-      chain: loc.chain ?? null,
-      lat,
-      lon
-    });
-  }
-
-  return out;
-}
-
-/** ---------------- Product details ---------------- */
-const KrogerPriceSchema = z
-  .object({
-    regular: z.union([z.number(), z.string()]).optional(),
-    promo: z.union([z.number(), z.string()]).optional()
-  })
-  .passthrough();
-
-const KrogerItemSchema = z
-  .object({
-    price: KrogerPriceSchema.optional().nullable()
-  })
-  .passthrough();
-
-const KrogerProductSchema = z
-  .object({
-    upc: z.string().optional(),
-    items: z.array(KrogerItemSchema).optional().nullable()
-  })
-  .passthrough();
-
-const KrogerProductDetailsResponseSchema = z
-  .object({
-    data: z.union([KrogerProductSchema, z.array(KrogerProductSchema)]).optional()
-  })
-  .passthrough();
-
-export type KrogerProductPrice = {
-  upc: string;
-  price_cents: number | null;
-};
-
-export function parseKrogerProductDetailsResponse(json: unknown, upcFallback: string): KrogerProductPrice {
-  const r = KrogerProductDetailsResponseSchema.parse(json);
-  const data = Array.isArray(r.data) ? r.data[0] : r.data;
-  if (!data) return { upc: upcFallback, price_cents: null };
-
-  const upc = data.upc ?? upcFallback;
-  const item = data.items?.[0];
-  const price = item?.price ?? null;
-
-  const promo = price ? toCents(price.promo) : null;
-  const regular = price ? toCents(price.regular) : null;
-
-  return { upc, price_cents: promo ?? regular ?? null };
-}
-
-/** ---------------- HTTP calls (with circuit breaker) ---------------- */
-export async function fetchKrogerToken(
-  db: D1Database,
-  opts: {
-    client_id: string;
-    client_secret: string;
-    token_url?: string;
-    scope?: string;
-    user_agent?: string;
-    referer?: string;
-  }
-): Promise<KrogerToken> {
-  if (await isOpen(db, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
-
-  const tokenUrl = opts.token_url ?? "https://api.kroger.com/v1/connect/oauth2/token";
-  const scope = opts.scope ?? "product.compact";
-  const auth = b64(`${opts.client_id}:${opts.client_secret}`);
-
-  try {
-    const res = await fetch(tokenUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${auth}`,
-        "Content-Type": "application/x-www-form-urlencoded",
-        ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
-        ...(opts.referer ? { Referer: opts.referer } : {})
-      },
-      body: new URLSearchParams({
-        grant_type: "client_credentials",
-        scope
-      }).toString()
-    });
-
-    const text = await res.text();
-    if (!res.ok) throw new Error(`KROGER_TOKEN_HTTP_${res.status}: ${text.slice(0, 300)}`);
-
-    const json = JSON.parse(text);
-    const parsed = parseKrogerTokenResponse(json);
-    await recordSuccess(db, PROVIDER);
-    return parsed;
-  } catch (e) {
-    await recordFailure(db, PROVIDER);
-    throw e;
-  }
-}
-
-export async function fetchKrogerLocations(
-  db: D1Database,
-  opts: {
-    access_token: string;
-    base_url?: string;
-    lat: number;
-    lon: number;
-    radius_miles?: number;
-    limit?: number;
-    user_agent?: string;
-    referer?: string;
-  }
-): Promise<KrogerLocation[]> {
-  if (await isOpen(db, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
-
-  const baseUrl = opts.base_url ?? "https://api.kroger.com/v1";
-  const radius = opts.radius_miles ?? 2;
-  const limit = opts.limit ?? 10;
-
-  const url = new URL(`${baseUrl}/locations`);
-  url.searchParams.set("filter.latLong.near", `${opts.lat},${opts.lon}`);
-  url.searchParams.set("filter.radiusInMiles", String(radius));
-  url.searchParams.set("filter.limit", String(limit));
-
-  try {
-    const res = await fetch(url.toString(), {
-      headers: {
-        Authorization: `Bearer ${opts.access_token}`,
-        Accept: "application/json",
-        ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
-        ...(opts.referer ? { Referer: opts.referer } : {})
-      }
-    });
-
-    const text = await res.text();
-    if (!res.ok) throw new Error(`KROGER_LOCATIONS_HTTP_${res.status}: ${text.slice(0, 300)}`);
-
-    const json = JSON.parse(text);
-    const parsed = parseKrogerLocationsResponse(json);
-    await recordSuccess(db, PROVIDER);
-    return parsed;
-  } catch (e) {
-    await recordFailure(db, PROVIDER);
-    throw e;
-  }
-}
-
-export async function fetchKrogerProductDetails(
-  db: D1Database,
-  opts: {
-    access_token: string;
-    base_url?: string;
-    location_id: string;
-    upc: string;
-    user_agent?: string;
-    referer?: string;
-  }
-): Promise<KrogerProductPrice> {
-  if (await isOpen(db, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
-
-  const baseUrl = opts.base_url ?? "https://api.kroger.com/v1";
-  const url = new URL(`${baseUrl}/products/${encodeURIComponent(opts.upc)}`);
-  url.searchParams.set("filter.locationId", opts.location_id);
-
-  try {
-    const res = await fetch(url.toString(), {
-      headers: {
-        Authorization: `Bearer ${opts.access_token}`,
-        Accept: "application/json",
-        ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
-        ...(opts.referer ? { Referer: opts.referer } : {})
-      }
-    });
-
-    const text = await res.text();
-    if (!res.ok) throw new Error(`KROGER_PRODUCT_HTTP_${res.status}: ${text.slice(0, 300)}`);
-
-    const json = JSON.parse(text);
-    const parsed = parseKrogerProductDetailsResponse(json, opts.upc);
-    await recordSuccess(db, PROVIDER);
-    return parsed;
-  } catch (e) {
-    await recordFailure(db, PROVIDER);
-    throw e;
-  }
-}
-</file>
-
-<file path="apps/api/src/providers/nominatim.ts">
-import { isOpen, recordFailure, recordSuccess } from "../lib/circuitBreaker";
-
-export type GeocodeResult = { lat: number; lon: number; display_name?: string };
-
-export async function geocode(
-  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string },
-  location: string
-): Promise<GeocodeResult> {
-  const provider = "nominatim";
-  if (await isOpen(env.DB, provider)) throw new Error("PROVIDER_OPEN");
-
-  const url = new URL("https://nominatim.openstreetmap.org/search");
-  url.searchParams.set("q", location);
-  url.searchParams.set("format", "json");
-  url.searchParams.set("limit", "1");
-
-  const headers: Record<string, string> = {
-    Accept: "application/json",
-    "User-Agent": env.OUTBOUND_USER_AGENT || "PriceCart/0.1 (contact: you@example.com)",
-    Referer: env.OUTBOUND_REFERER || "https://example.com"
-  };
-
-  try {
-    const res = await fetch(url.toString(), { headers });
-    if (!res.ok) {
-      await recordFailure(env.DB, provider);
-      throw new Error(`Nominatim HTTP ${res.status}`);
-    }
-
-    const json = (await res.json()) as Array<{ lat: string; lon: string; display_name?: string }>;
-    if (!json[0]) {
-      await recordSuccess(env.DB, provider);
-      throw new Error("NOT_FOUND");
-    }
-
-    await recordSuccess(env.DB, provider);
-    return { lat: Number(json[0].lat), lon: Number(json[0].lon), display_name: json[0].display_name };
-  } catch (e) {
-    await recordFailure(env.DB, provider);
-    throw e;
-  }
-}
-</file>
-
 <file path="apps/api/src/providers/openFoodFacts.contract.test.ts">
 import { describe, expect, it } from "vitest";
 import { parseOffLookupResponse, parseOffSearchResponse } from "./openFoodFacts";
@@ -1099,253 +1137,155 @@ describe("OpenFoodFacts provider parsing", () => {
 });
 </file>
 
-<file path="apps/api/src/providers/openFoodFacts.ts">
-import { z } from "zod";
-import { isOpen, recordFailure, recordSuccess } from "../lib/circuitBreaker";
+<file path="apps/api/src/routes/internal.ts">
+import { Hono } from "hono";
+import { estimateP95FromBuckets } from "../lib/metrics";
 
-export const OFF_ATTRIBUTION = {
-  text: "Data from Open Food Facts",
-  links: [
-    { label: "Open Food Facts", href: "https://world.openfoodfacts.org" },
-    { label: "API", href: "https://openfoodfacts.github.io/openfoodfacts-server/api/" }
-  ]
-};
-
-export type OffProductRaw = {
-  code: string;
-  product_name: string | null;
-  brands: string | null;
-  quantity: string | null;
-  image_front_url: string | null;
-  url: string | null;
-  last_modified_t: number | null;
-};
-
-const OffProductSchema = z
-  .object({
-    code: z.string().optional(),
-    product_name: z.string().optional(),
-    brands: z.string().optional(),
-    quantity: z.string().optional(),
-    image_front_url: z.string().url().optional(),
-    url: z.string().url().optional(),
-    last_modified_t: z.number().optional()
-  })
-  .passthrough();
-
-const OffLookupSchema = z
-  .object({
-    status: z.number(),
-    status_verbose: z.string().optional(),
-    product: OffProductSchema.optional()
-  })
-  .passthrough();
-
-const OffSearchSchema = z
-  .object({
-    count: z.number().optional(),
-    page: z.number().optional(),
-    page_size: z.number().optional(),
-    products: z.array(OffProductSchema).default([])
-  })
-  .passthrough();
-
-export function parseOffLookupResponse(json: unknown, upc: string): OffProductRaw {
-  const parsed = OffLookupSchema.safeParse(json);
-  if (!parsed.success) throw new Error("OFF_SCHEMA");
-
-  if (parsed.data.status !== 1 || !parsed.data.product) throw new Error("NOT_FOUND");
-
-  const p = parsed.data.product;
-  return {
-    code: String(p.code ?? upc),
-    product_name: p.product_name ?? null,
-    brands: p.brands ?? null,
-    quantity: p.quantity ?? null,
-    image_front_url: p.image_front_url ?? null,
-    url: p.url ?? null,
-    last_modified_t: p.last_modified_t ?? null
-  };
+function requireInternal(c: any) {
+  const token = c.env.INTERNAL_TOKEN;
+  const got = c.req.header("x-pricecart-internal");
+  return token && got && got === token;
 }
 
-export function parseOffSearchResponse(json: unknown): {
-  total: number;
-  page: number;
-  page_size: number;
-  products: OffProductRaw[];
-} {
-  const parsed = OffSearchSchema.safeParse(json);
-  if (!parsed.success) throw new Error("OFF_SCHEMA");
-
-  const total = parsed.data.count ?? parsed.data.products.length;
-  const page = parsed.data.page ?? 1;
-  const page_size = parsed.data.page_size ?? parsed.data.products.length;
-
-  const products: OffProductRaw[] = parsed.data.products.map((p) => ({
-    code: String(p.code ?? ""),
-    product_name: p.product_name ?? null,
-    brands: p.brands ?? null,
-    quantity: p.quantity ?? null,
-    image_front_url: p.image_front_url ?? null,
-    url: p.url ?? null,
-    last_modified_t: p.last_modified_t ?? null
-  }));
-
-  return { total, page, page_size, products };
+function errorResponse(c: any, code: string, message: string, status: number) {
+  const requestId = c.get?.("request_id");
+  return c.json(
+    {
+      error: {
+        code,
+        message,
+        request_id: requestId ?? undefined
+      }
+    },
+    status
+  );
 }
 
-function buildHeaders(env: { OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string }): Record<string, string> {
-  return {
-    Accept: "application/json",
-    "User-Agent": env.OUTBOUND_USER_AGENT || "PriceCart/0.1 (contact: you@example.com)",
-    Referer: env.OUTBOUND_REFERER || "https://example.com"
-  };
-}
+export const internalRoutes = new Hono();
 
-async function fetchJson(url: string, headers: Record<string, string>, timeoutMs: number) {
-  const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { headers, signal: ctrl.signal });
-    return { res, json: await res.json().catch(() => null) };
-  } finally {
-    clearTimeout(id);
+internalRoutes.use("*", async (c, next) => {
+  if (!requireInternal(c)) {
+    return errorResponse(c, "UNAUTHORIZED", "internal", 401);
   }
-}
+  await next();
+});
 
-export async function offLookupByUpc(
-  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string; OFF_BASE_URL?: string },
-  upc: string
-): Promise<OffProductRaw> {
-  const provider = "openfoodfacts";
-  if (await isOpen(env.DB, provider)) throw new Error("PROVIDER_OPEN");
+internalRoutes.get("/attributions", (c) => {
+  return c.json({
+    attributions: [
+      {
+        id: "osm",
+        name: "OpenStreetMap",
+        license: "ODbL",
+        required_text: "© OpenStreetMap contributors",
+        link: "https://www.openstreetmap.org/copyright",
+        where: ["Map view", "Store discovery/search"]
+      },
+      {
+        id: "nominatim",
+        name: "Nominatim",
+        required_text: "Geocoding by Nominatim (OpenStreetMap)",
+        link: "https://operations.osmfoundation.org/policies/nominatim/",
+        where: ["Store discovery/search"]
+      },
+      {
+        id: "overpass",
+        name: "Overpass API",
+        required_text: "POI search via Overpass API (OpenStreetMap)",
+        link: "https://dev.overpass-api.de/overpass-doc/en/preface/commons.html",
+        where: ["Store discovery/search"]
+      },
+      {
+        id: "openfoodfacts",
+        name: "Open Food Facts",
+        license: "ODbL",
+        required_text: "Data © Open Food Facts contributors",
+        link: "https://world.openfoodfacts.org/terms-of-use",
+        where: ["Product lookup", "Product search"]
+      },
+      {
+        id: "openprices",
+        name: "Open Prices",
+        license: "ODbL (data)",
+        required_text: "Price data © Open Prices contributors",
+        link: "https://prices.openfoodfacts.org",
+        where: ["Price history", "Price evidence"]
+      },
+      {
+        id: "kroger",
+        name: "Kroger API",
+        required_text: "Live prices via Kroger API (where available)",
+        link: "https://developer.kroger.com/",
+        where: ["Live price overlay"]
+      }
+    ]
+  });
+});
 
-  const base = env.OFF_BASE_URL || "https://world.openfoodfacts.org";
-  const url = new URL(`${base}/api/v2/product/${encodeURIComponent(upc)}.json`);
-  url.searchParams.set("fields", "code,product_name,brands,quantity,image_front_url,url,last_modified_t");
+internalRoutes.get("/metrics", async (c) => {
+  const sinceMinutes = 60;
+  const nowBucket = Math.floor(Date.now() / 60000);
+  const minBucket = nowBucket - sinceMinutes;
 
-  try {
-    const { res, json } = await fetchJson(url.toString(), buildHeaders(env), 8000);
-    if (!res.ok) {
-      await recordFailure(env.DB, provider);
-      throw new Error(`OFF_HTTP_${res.status}`);
-    }
+  const routeRows = await c.env.DB
+    .prepare(
+      `SELECT route, method, status_class,
+              SUM(count) AS count,
+              SUM(sum_ms) AS sum_ms,
+              MAX(max_ms) AS max_ms,
+              SUM(b_50) AS b_50,
+              SUM(b_100) AS b_100,
+              SUM(b_250) AS b_250,
+              SUM(b_500) AS b_500,
+              SUM(b_1000) AS b_1000,
+              SUM(b_inf) AS b_inf
+         FROM route_metrics
+        WHERE minute_bucket >= ?
+        GROUP BY route, method, status_class
+        ORDER BY count DESC`
+    )
+    .bind(minBucket)
+    .all();
 
-    const product = parseOffLookupResponse(json, upc);
-    await recordSuccess(env.DB, provider);
-    return product;
-  } catch (e) {
-    await recordFailure(env.DB, provider);
-    throw e;
-  }
-}
-
-export async function offSearch(
-  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string; OFF_BASE_URL?: string },
-  q: string,
-  page: number,
-  pageSize: number
-): Promise<{ total: number; page: number; page_size: number; products: OffProductRaw[] }> {
-  const provider = "openfoodfacts";
-  if (await isOpen(env.DB, provider)) throw new Error("PROVIDER_OPEN");
-
-  const base = env.OFF_BASE_URL || "https://world.openfoodfacts.org";
-  const url = new URL(`${base}/api/v2/search`);
-  url.searchParams.set("search_terms", q);
-  url.searchParams.set("page", String(page));
-  url.searchParams.set("page_size", String(pageSize));
-  url.searchParams.set("fields", "code,product_name,brands,quantity,image_front_url,url,last_modified_t");
-
-  try {
-    const { res, json } = await fetchJson(url.toString(), buildHeaders(env), 9000);
-    if (!res.ok) {
-      await recordFailure(env.DB, provider);
-      throw new Error(`OFF_HTTP_${res.status}`);
-    }
-
-    const parsed = parseOffSearchResponse(json);
-    await recordSuccess(env.DB, provider);
-    return { total: parsed.total, page: parsed.page, page_size: parsed.page_size, products: parsed.products };
-  } catch (e) {
-    await recordFailure(env.DB, provider);
-    throw e;
-  }
-}
-</file>
-
-<file path="apps/api/src/providers/overpass.ts">
-import { isOpen, recordFailure, recordSuccess } from "../lib/circuitBreaker";
-
-export type OverpassStore = {
-  external_id: string; // osm:node/123
-  name: string;
-  lat: number;
-  lon: number;
-  tags: Record<string, string>;
-};
-
-export async function queryNearbyStores(
-  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string },
-  center: { lat: number; lon: number },
-  radiusM: number
-): Promise<OverpassStore[]> {
-  const provider = "overpass";
-  if (await isOpen(env.DB, provider)) throw new Error("PROVIDER_OPEN");
-
-  const query = `
-[out:json][timeout:25];
-(
-  node[shop=supermarket](around:${radiusM},${center.lat},${center.lon});
-  node[shop=convenience](around:${radiusM},${center.lat},${center.lon});
-  node[shop=greengrocer](around:${radiusM},${center.lat},${center.lon});
-);
-out body;
-`;
-
-  const headers: Record<string, string> = {
-    "Content-Type": "application/x-www-form-urlencoded",
-    Accept: "application/json",
-    "User-Agent": env.OUTBOUND_USER_AGENT || "PriceCart/0.1 (contact: you@example.com)",
-    Referer: env.OUTBOUND_REFERER || "https://example.com"
-  };
-
-  try {
-    const res = await fetch("https://overpass-api.de/api/interpreter", {
-      method: "POST",
-      headers,
-      body: new URLSearchParams({ data: query }).toString()
+  const routes = (routeRows.results as any[]).map((row) => {
+    const total = Number(row.count || 0);
+    const p95 = estimateP95FromBuckets(total, {
+      b_50: Number(row.b_50 || 0),
+      b_100: Number(row.b_100 || 0),
+      b_250: Number(row.b_250 || 0),
+      b_500: Number(row.b_500 || 0),
+      b_1000: Number(row.b_1000 || 0),
+      b_inf: Number(row.b_inf || 0)
     });
 
-    if (!res.ok) {
-      await recordFailure(env.DB, provider);
-      throw new Error(`Overpass HTTP ${res.status}`);
-    }
-
-    const json = (await res.json()) as {
-      elements: Array<{ type: string; id: number; lat: number; lon: number; tags?: Record<string, string> }>;
+    return {
+      route: row.route,
+      method: row.method,
+      status_class: Number(row.status_class),
+      count: total,
+      avg_ms: total ? Math.round(Number(row.sum_ms) / total) : null,
+      max_ms: Number(row.max_ms || 0),
+      p95_upper_bound_ms: p95
     };
+  });
 
-    const stores: OverpassStore[] = (json.elements || [])
-      .filter((e) => e.type === "node")
-      .map((e) => {
-        const tags = e.tags || {};
-        const name = tags.name || tags.brand || "Unnamed store";
-        return {
-          external_id: `osm:${e.type}/${e.id}`,
-          name,
-          lat: e.lat,
-          lon: e.lon,
-          tags
-        };
-      });
+  const providerRows = await c.env.DB
+    .prepare(
+      `SELECT provider, outcome, SUM(count) AS count
+         FROM provider_metrics
+        WHERE minute_bucket >= ?
+        GROUP BY provider, outcome
+        ORDER BY count DESC`
+    )
+    .bind(minBucket)
+    .all();
 
-    await recordSuccess(env.DB, provider);
-    return stores;
-  } catch (e) {
-    await recordFailure(env.DB, provider);
-    throw e;
-  }
-}
+  return c.json({
+    window_minutes: sinceMinutes,
+    routes,
+    providers: providerRows.results
+  });
+});
 </file>
 
 <file path="apps/api/src/services/cart.ts">
@@ -1536,260 +1476,6 @@ export async function clearCart(env: EnvLike, session_id: string): Promise<Cart>
 
   await touchCart(env, session_id);
   return getCart(env, session_id);
-}
-</file>
-
-<file path="apps/api/src/services/krogerLivePrices.ts">
-import { cacheGet, cachePut } from "../lib/cache";
-import { distanceMeters } from "../lib/geo";
-import { takeToken } from "../lib/rateLimit";
-import { nowSec } from "../lib/time";
-import {
-  fetchKrogerLocations,
-  fetchKrogerProductDetails,
-  fetchKrogerToken,
-  type KrogerLocation
-} from "../providers/kroger";
-
-type EnvLike = {
-  DB: D1Database;
-  OUTBOUND_USER_AGENT?: string;
-  OUTBOUND_REFERER?: string;
-
-  KROGER_LIVE_PRICES_ENABLED?: string;
-  KROGER_CLIENT_ID?: string;
-  KROGER_CLIENT_SECRET?: string;
-  KROGER_BASE_URL?: string;
-  KROGER_TOKEN_URL?: string;
-};
-
-export type LivePriceOverlayInput = {
-  session_id: string;
-  store: {
-    id: string;
-    name: string;
-    lat: number;
-    lon: number;
-    tags: Record<string, unknown>;
-  };
-  upcs: string[];
-  t: number;
-};
-
-export type LivePriceOverlayResult = {
-  prices_by_upc: Map<string, { price_cents: number; observed_at: number; confidence: number }>;
-  warnings: string[];
-};
-
-const MAX_UPCS_PER_QUOTE = 25;
-
-const TOKEN_CACHE_KEY = "kroger:token:product.compact";
-const TOKEN_MIN_TTL_SEC = 60;
-
-const PRICE_CACHE_TTL_SEC = 10 * 60; // 10 minutes
-const LOCATION_CACHE_MIN_FRESH_SEC = 90 * 24 * 60 * 60; // 90 days
-
-const LOCATION_RADIUS_MILES = 2;
-const MATCH_THRESHOLD_METERS = 700; // conservative match threshold
-
-// Budgets (per session)
-const RL_LOCATIONS = { capacity: 3, refillPerSec: 1 / 30, cost: 1 };
-const RL_PRODUCTS  = { capacity: 25, refillPerSec: 1 / 2, cost: 1 };
-const RL_TOKEN     = { capacity: 2, refillPerSec: 1 / 60, cost: 1 };
-
-function isEnabled(env: EnvLike) {
-  const v = (env.KROGER_LIVE_PRICES_ENABLED ?? "").toLowerCase();
-  return v === "1" || v === "true" || v === "yes";
-}
-
-function hasCreds(env: EnvLike) {
-  return !!(env.KROGER_CLIENT_ID && env.KROGER_CLIENT_SECRET);
-}
-
-async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R>): Promise<R[]> {
-  const out: R[] = new Array(items.length);
-  let idx = 0;
-
-  const workers = new Array(Math.max(1, limit)).fill(null).map(async () => {
-    while (true) {
-      const i = idx++;
-      if (i >= items.length) return;
-      out[i] = await fn(items[i]);
-    }
-  });
-
-  await Promise.all(workers);
-  return out;
-}
-
-async function getAccessToken(env: EnvLike, session_id: string): Promise<string> {
-  const cached = await cacheGet<{ access_token: string; expires_at: number }>(env.DB, TOKEN_CACHE_KEY);
-  const now = nowSec();
-  if (cached && cached.expires_at > now + TOKEN_MIN_TTL_SEC) return cached.access_token;
-
-  const ok = await takeToken(env.DB, `kroger:${session_id}:token`, RL_TOKEN);
-  if (!ok) throw new Error("KROGER_RATE_LIMITED_TOKEN");
-
-  const token = await fetchKrogerToken(env.DB, {
-    client_id: env.KROGER_CLIENT_ID!,
-    client_secret: env.KROGER_CLIENT_SECRET!,
-    token_url: env.KROGER_TOKEN_URL,
-    scope: "product.compact",
-    user_agent: env.OUTBOUND_USER_AGENT,
-    referer: env.OUTBOUND_REFERER
-  });
-
-  const ttl = Math.max(TOKEN_MIN_TTL_SEC, (token.expires_in_sec ?? 1800) - 60);
-  const payload = {
-    access_token: token.access_token,
-    expires_at: now + ttl
-  };
-  await cachePut(env.DB, TOKEN_CACHE_KEY, payload, ttl);
-
-  return token.access_token;
-}
-
-async function getMappedLocationId(env: EnvLike, store_id: string): Promise<string | null> {
-  const row = await env.DB.prepare(
-    `SELECT provider_location_id, verified_at
-     FROM store_provider_mappings
-     WHERE store_id = ? AND provider = 'kroger'
-     LIMIT 1`
-  )
-    .bind(store_id)
-    .first<{ provider_location_id: string; verified_at: number }>();
-
-  if (!row) return null;
-  if (nowSec() - row.verified_at < LOCATION_CACHE_MIN_FRESH_SEC) return row.provider_location_id;
-  return null;
-}
-
-async function upsertLocationId(
-  env: EnvLike,
-  store_id: string,
-  location_id: string,
-  match_method: string,
-  match_score: number
-) {
-  const t = nowSec();
-  await env.DB.prepare(
-    `INSERT OR REPLACE INTO store_provider_mappings
-      (store_id, provider, provider_location_id, match_method, match_score, created_at, verified_at)
-     VALUES (?, 'kroger', ?, ?, ?, COALESCE((SELECT created_at FROM store_provider_mappings WHERE store_id = ? AND provider='kroger'), ?), ?)`
-  )
-    .bind(store_id, location_id, match_method, match_score, store_id, t, t)
-    .run();
-}
-
-function pickBestLocation(store: LivePriceOverlayInput["store"], locations: KrogerLocation[]) {
-  let best: { location: KrogerLocation; dist_m: number } | null = null;
-  for (const loc of locations) {
-    const d = distanceMeters(store.lat, store.lon, loc.lat, loc.lon);
-    if (!best || d < best.dist_m) best = { location: loc, dist_m: d };
-  }
-  return best;
-}
-
-async function resolveLocationId(env: EnvLike, input: LivePriceOverlayInput): Promise<string | null> {
-  const memo = await getMappedLocationId(env, input.store.id);
-  if (memo) return memo;
-
-  const ok = await takeToken(env.DB, `kroger:${input.session_id}:locations`, RL_LOCATIONS);
-  if (!ok) return null;
-
-  const token = await getAccessToken(env, input.session_id);
-  const locations = await fetchKrogerLocations(env.DB, {
-    access_token: token,
-    base_url: env.KROGER_BASE_URL,
-    lat: input.store.lat,
-    lon: input.store.lon,
-    radius_miles: LOCATION_RADIUS_MILES,
-    limit: 10,
-    user_agent: env.OUTBOUND_USER_AGENT,
-    referer: env.OUTBOUND_REFERER
-  });
-
-  const best = pickBestLocation(input.store, locations);
-  if (!best) return null;
-
-  if (best.dist_m > MATCH_THRESHOLD_METERS) return null;
-
-  const score = Math.max(0, 1 - best.dist_m / MATCH_THRESHOLD_METERS);
-  await upsertLocationId(env, input.store.id, best.location.locationId, "auto_nearest", score);
-  return best.location.locationId;
-}
-
-export async function getKrogerLivePriceOverlay(env: EnvLike, input: LivePriceOverlayInput): Promise<LivePriceOverlayResult> {
-  const warnings: string[] = [];
-  const prices_by_upc = new Map<string, { price_cents: number; observed_at: number; confidence: number }>();
-
-  if (!isEnabled(env)) return { prices_by_upc, warnings };
-  if (!hasCreds(env)) {
-    warnings.push("KROGER_MISCONFIGURED_MISSING_CREDS");
-    return { prices_by_upc, warnings };
-  }
-
-  const upcs = input.upcs.slice(0, MAX_UPCS_PER_QUOTE);
-
-  let locationId: string | null = null;
-  try {
-    locationId = await resolveLocationId(env, input);
-  } catch {
-    warnings.push("KROGER_UNAVAILABLE_LOCATION_LOOKUP");
-    return { prices_by_upc, warnings };
-  }
-  if (!locationId) return { prices_by_upc, warnings };
-
-  let token: string;
-  try {
-    token = await getAccessToken(env, input.session_id);
-  } catch {
-    warnings.push("KROGER_UNAVAILABLE_AUTH");
-    return { prices_by_upc, warnings };
-  }
-
-  const observed_at = nowSec();
-  let partial = false;
-
-  await mapLimit(upcs, 4, async (upc) => {
-    const cacheKey = `kroger:price:${locationId}:${upc}`;
-    const cached = await cacheGet<{ price_cents: number; observed_at: number }>(env.DB, cacheKey);
-
-    if (cached && Number.isFinite(cached.price_cents)) {
-      prices_by_upc.set(upc, { price_cents: cached.price_cents, observed_at: cached.observed_at, confidence: 0.95 });
-      return;
-    }
-
-    const ok = await takeToken(env.DB, `kroger:${input.session_id}:products`, RL_PRODUCTS);
-    if (!ok) {
-      partial = true;
-      return;
-    }
-
-    try {
-      const r = await fetchKrogerProductDetails(env.DB, {
-        access_token: token,
-        base_url: env.KROGER_BASE_URL,
-        location_id: locationId!,
-        upc,
-        user_agent: env.OUTBOUND_USER_AGENT,
-        referer: env.OUTBOUND_REFERER
-      });
-
-      if (r.price_cents == null) {
-        partial = true;
-        return;
-      }
-
-      await cachePut(env.DB, cacheKey, { price_cents: r.price_cents, observed_at }, PRICE_CACHE_TTL_SEC);
-      prices_by_upc.set(upc, { price_cents: r.price_cents, observed_at, confidence: 0.95 });
-    } catch {
-      partial = true;
-    }
-  });
-
-  if (partial) warnings.push("KROGER_PARTIAL_OR_RATE_LIMITED");
-  return { prices_by_upc, warnings };
 }
 </file>
 
@@ -2055,319 +1741,6 @@ async function refreshSearch(
 
   await cachePut(env.DB, cacheKey, resp, TTL_SEARCH_SEC);
   return resp;
-}
-</file>
-
-<file path="apps/api/src/services/productSearch.ts">
-import { cacheGet, cachePut } from "../lib/cache";
-import { sha256Base64Url } from "../lib/hash";
-import { takeToken } from "../lib/rateLimit";
-
-const TTL_OFF_SEARCH_SEC = 60 * 60; // 1 hour cache
-const RL_OFF_SEARCH = { capacity: 10, refillPerSec: 1 / 6, cost: 1 }; // ~10/min per session
-
-type OffSearchResponse = {
-  products?: unknown[];
-  count?: number | string;
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function toStringValue(value: unknown): string | undefined {
-  if (typeof value === "string") return value;
-  if (typeof value === "number") return String(value);
-  return undefined;
-}
-
-function toNumberValue(value: unknown): number | undefined {
-  if (typeof value === "number") return value;
-  if (typeof value === "string") {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : undefined;
-  }
-  return undefined;
-}
-
-type EnvLike = {
-  DB: D1Database;
-  OUTBOUND_USER_AGENT?: string;
-  OUTBOUND_REFERER?: string;
-  OFF_BASE_URL?: string; // optional
-};
-
-export type ProductSummary = {
-  code: string;
-  product_name?: string;
-  brands?: string;
-  quantity?: string;
-  image_url?: string;
-  nutriscore_grade?: string;
-};
-
-export type ProductSearchResponse = {
-  q: string;
-  page: number;
-  page_size: number;
-  total_count: number;
-  products: ProductSummary[];
-  attribution: {
-    text: string;
-    links: { label: string; href: string }[];
-  };
-};
-
-export async function productSearch(
-  env: EnvLike,
-  input: { q: string; page: number; page_size: number; session_id: string }
-): Promise<ProductSearchResponse> {
-  const q = input.q.trim();
-  const page = Math.max(1, input.page);
-  const pageSize = Math.min(Math.max(1, input.page_size), 50);
-
-  const cacheKey = `off:search:${await sha256Base64Url(
-    `${q.toLowerCase()}|p=${page}|s=${pageSize}`
-  )}`;
-
-  const cached = await cacheGet<ProductSearchResponse>(env.DB, cacheKey);
-  if (cached) return cached;
-
-  const ok = await takeToken(env.DB, `rl:${input.session_id}:off_search`, RL_OFF_SEARCH);
-  if (!ok) throw new Error("RATE_LIMIT_OFF_SEARCH");
-
-  const base = (env.OFF_BASE_URL || "https://world.openfoodfacts.org").replace(/\/+$/, "");
-  const url = new URL(`${base}/cgi/search.pl`);
-  url.searchParams.set("action", "process");
-  url.searchParams.set("search_terms", q);
-  url.searchParams.set("search_simple", "1");
-  url.searchParams.set("json", "1");
-  url.searchParams.set("page", String(page));
-  url.searchParams.set("page_size", String(pageSize));
-
-  const headers = new Headers();
-  // OFF asks for a custom User-Agent to identify your app. :contentReference[oaicite:2]{index=2}
-  headers.set("User-Agent", env.OUTBOUND_USER_AGENT || "PriceCart/0.1 (dev)");
-  if (env.OUTBOUND_REFERER) headers.set("Referer", env.OUTBOUND_REFERER);
-
-  const resp = await fetch(url.toString(), { headers });
-  if (resp.status === 429) throw new Error("RATE_LIMIT_OFF_REMOTE");
-  if (!resp.ok) throw new Error(`OFF_HTTP_${resp.status}`);
-
-  const rawData = await resp.json();
-  const data = isRecord(rawData) ? (rawData as OffSearchResponse) : {};
-  const productsRaw: unknown[] = Array.isArray(data.products) ? data.products : [];
-
-  const products: ProductSummary[] = productsRaw
-    .map((p) => {
-      if (!isRecord(p)) return null;
-      const code = toStringValue(p["code"])?.trim();
-      if (!code) return null;
-
-      return {
-        code,
-        product_name: toStringValue(p["product_name"]) ?? toStringValue(p["product_name_en"]),
-        brands: toStringValue(p["brands"]),
-        quantity: toStringValue(p["quantity"]),
-        image_url: toStringValue(p["image_url"]),
-        nutriscore_grade: toStringValue(p["nutriscore_grade"])
-      } satisfies ProductSummary;
-    })
-    .filter(Boolean) as ProductSummary[];
-
-  const out: ProductSearchResponse = {
-    q,
-    page,
-    page_size: pageSize,
-    total_count: toNumberValue(data.count) ?? products.length,
-    products,
-    attribution: {
-      text: "Data from Open Food Facts",
-      links: [{ label: "Open Food Facts", href: "https://world.openfoodfacts.org/" }]
-    }
-  };
-
-  await cachePut(env.DB, cacheKey, out, TTL_OFF_SEARCH_SEC);
-  return out;
-}
-</file>
-
-<file path="apps/api/src/services/storeDiscovery.ts">
-import type { StoreSearchResponse } from "@pricecart/shared";
-import { cacheGet, cachePut } from "../lib/cache";
-import { distanceMeters } from "../lib/geo";
-import { sha256Base64Url } from "../lib/hash";
-import { takeToken } from "../lib/rateLimit";
-import { nowSec } from "../lib/time";
-import { geocode } from "../providers/nominatim";
-import { queryNearbyStores } from "../providers/overpass";
-
-const TTL_GEOCODE_SEC = 60 * 60 * 24 * 30; // 30 days
-const TTL_STORES_SEC = 60 * 60 * 24;      // 1 day
-
-// Budgets (demo-friendly, provider-friendly)
-const RL_GEOCODE = { capacity: 10, refillPerSec: 1 / 10, cost: 1 };   // ~10/min max per session
-const RL_OVERPASS = { capacity: 10, refillPerSec: 1 / 30, cost: 1 };  // ~10/5min max per session
-
-export async function storeSearch(
-  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string },
-  input: { location: string; radius_m: number; session_id: string }
-): Promise<StoreSearchResponse> {
-  const radius = Math.min(Math.max(input.radius_m, 250), 20000); // clamp 250m..20km
-
-  // 1) Geocode with caching + rate limit
-  const locNorm = input.location.trim().toLowerCase();
-  const geoKey = `geo:${await sha256Base64Url(locNorm)}`;
-  let center = await cacheGet<{ lat: number; lon: number }>(env.DB, geoKey);
-
-  if (!center) {
-    const ok = await takeToken(env.DB, `rl:${input.session_id}:nominatim`, RL_GEOCODE);
-    if (!ok) throw new Error("RATE_LIMIT_GEOCODE");
-
-    try {
-      const g = await geocode(env, input.location);
-      center = { lat: g.lat, lon: g.lon };
-      await cachePut(env.DB, geoKey, center, TTL_GEOCODE_SEC);
-    } catch (geocodeErr) {
-      try {
-        const fallback = await seedResponse(env, radius);
-        console.log(
-          JSON.stringify({
-            level: "warn",
-            message: "geocode failed, falling back to seeded stores",
-            err: String(geocodeErr)
-          })
-        );
-        return fallback;
-      } catch {
-        throw geocodeErr;
-      }
-    }
-  }
-
-  // 2) Store query with caching + rate limit + fallback
-  const storesKey = `stores:${await sha256Base64Url(
-    `${center.lat.toFixed(3)},${center.lon.toFixed(3)}:r=${radius}`
-  )}`;
-
-  const cached = await cacheGet<{ stores: StoreSearchResponse["stores"] }>(env.DB, storesKey);
-  if (cached?.stores?.length) {
-    return {
-      center,
-      radius_m: radius,
-      data_mode: "cache",
-      stores: cached.stores,
-      attribution: osmAttribution()
-    };
-  }
-
-  // Try live Overpass, else seed fallback.
-  try {
-    const ok = await takeToken(env.DB, `rl:${input.session_id}:overpass`, RL_OVERPASS);
-    if (!ok) throw new Error("RATE_LIMIT_OVERPASS");
-
-    const raw = await queryNearbyStores(env, center, radius);
-
-    const stores = raw
-      .map((s) => ({
-        id: s.external_id,
-        name: s.name,
-        lat: s.lat,
-        lon: s.lon,
-        distance_m: Math.round(distanceMeters(center, { lat: s.lat, lon: s.lon })),
-        tags: s.tags
-      }))
-      .sort((a, b) => a.distance_m - b.distance_m)
-      .slice(0, 50);
-
-    await cachePut(env.DB, storesKey, { stores }, TTL_STORES_SEC);
-
-    // Opportunistic upsert into stores table (useful later, not required to return)
-    const t = nowSec();
-    const stmt = env.DB.prepare(
-      "INSERT OR REPLACE INTO stores (id, source, external_id, name, lat, lon, tags_json, last_seen_at) VALUES (?, 'osm', ?, ?, ?, ?, ?, ?)"
-    );
-    const batch = stores.map((st) =>
-      stmt.bind(st.id, st.id, st.name, st.lat, st.lon, JSON.stringify(st.tags ?? {}), t)
-    );
-    await env.DB.batch(batch);
-
-    return {
-      center,
-      radius_m: radius,
-      data_mode: "live",
-      stores,
-      attribution: osmAttribution()
-    };
-  } catch {
-    return seedResponse(env, radius, center);
-  }
-}
-
-function safeJson(s: string | null | undefined): Record<string, string> {
-  if (!s) return {};
-  try {
-    return JSON.parse(s) as Record<string, string>;
-  } catch {
-    return {};
-  }
-}
-
-function osmAttribution() {
-  return {
-    text: "© OpenStreetMap contributors",
-    links: [{ label: "OpenStreetMap", href: "https://www.openstreetmap.org/copyright" }]
-  };
-}
-
-async function seedResponse(
-  env: { DB: D1Database },
-  radius: number,
-  centerOverride?: { lat: number; lon: number }
-): Promise<StoreSearchResponse> {
-  const seed = await env.DB
-    .prepare("SELECT id, name, lat, lon, tags_json FROM stores WHERE source = 'seed'")
-    .all<{ id: string; name: string; lat: number; lon: number; tags_json: string }>();
-
-  const rows = seed.results || [];
-  const center =
-    centerOverride ?? (rows.length ? centerFromSeedRows(rows) : null);
-
-  if (!center) throw new Error("NO_SEED_STORES");
-
-  const stores = rows
-    .map((s) => ({
-      id: s.id,
-      name: s.name,
-      lat: s.lat,
-      lon: s.lon,
-      distance_m: Math.round(distanceMeters(center, { lat: s.lat, lon: s.lon })),
-      tags: safeJson(s.tags_json)
-    }))
-    .sort((a, b) => a.distance_m - b.distance_m);
-
-  return {
-    center,
-    radius_m: radius,
-    data_mode: "seed",
-    stores,
-    attribution: osmAttribution()
-  };
-}
-
-function centerFromSeedRows(rows: Array<{ lat: number; lon: number }>) {
-  if (!rows.length) return null;
-
-  const { lat, lon } = rows.reduce(
-    (acc, row) => {
-      acc.lat += row.lat;
-      acc.lon += row.lon;
-      return acc;
-    },
-    { lat: 0, lon: 0 }
-  );
-
-  return { lat: lat / rows.length, lon: lon / rows.length };
 }
 </file>
 
@@ -2869,41 +2242,6 @@ export default tseslint.config([
 }
 </file>
 
-<file path="apps/api/wrangler.jsonc">
-/**
- * For more details on how to configure Wrangler, refer to:
- * https://developers.cloudflare.com/workers/wrangler/configuration/
- */
-{
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "api",
-  "main": "worker/index.ts",
-  "compatibility_date": "2025-12-25",
-
-  "observability": { "enabled": true },
-
-  "vars": {
-    "OUTBOUND_USER_AGENT": "PriceCart/0.1 (contact: you@example.com)",
-    "OUTBOUND_REFERER": "http://localhost:5173",
-    "OFF_BASE_URL": "https://world.openfoodfacts.org"
-  },
-
-  "assets": {
-    "not_found_handling": "single-page-application",
-    "binding": "ASSETS",
-    "run_worker_first": ["/api/*", "/health", "/stores/*", "/products/*"]
-  },
-
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "pricecart",
-      "database_id": "f0f7e12d-54da-4aa0-a94e-d84a80a71169"
-    }
-  ]
-}
-</file>
-
 <file path="apps/api/wrangler.toml">
 name = "api"
 main = "worker/index.ts"
@@ -2926,6 +2264,37 @@ run_worker_first = ["/api/*", "/health", "/stores/*", "/products/*"]
 binding = "DB"
 database_name = "pricecart"
 database_id = "f0f7e12d-54da-4aa0-a94e-d84a80a71169"
+</file>
+
+<file path="apps/web/src/components/AttributionFooter.tsx">
+export type AttributionItem = {
+  id: string;
+  text: string;
+  href: string;
+};
+
+export function AttributionFooter(props: { items: AttributionItem[] }) {
+  if (!props.items.length) return null;
+
+  return (
+    <footer
+      role="contentinfo"
+      aria-label="Provider attributions"
+      style={{ marginTop: 32, borderTop: "1px solid #eee", paddingTop: 12, fontSize: 12 }}
+    >
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+        {props.items.map((item, index) => (
+          <span key={item.id}>
+            <a href={item.href} target="_blank" rel="noreferrer">
+              {item.text}
+            </a>
+            {index < props.items.length - 1 ? " · " : ""}
+          </span>
+        ))}
+      </div>
+    </footer>
+  );
+}
 </file>
 
 <file path="apps/web/src/lib/cart.ts">
@@ -3790,6 +3159,86 @@ apps/api/worker-configuration.d.ts
 packages/shared/dist/
 </file>
 
+<file path="README.md">
+# PriceCart
+
+PriceCart is a Proof-of-Concept for comparing grocery pricing across stores. The workspace includes:
+
+- `apps/web`: React + Vite single-page app that drives the UI/UX
+- `apps/api`: Hono-based Cloudflare Worker that talks to D1 and public providers
+- `packages/shared`: Type-safe schemas used by both the UI and worker
+
+## How to run locally
+
+1. `npm ci` (installs all workspaces)
+2. Start the API (runs against your local D1 and Cloudflare bindings):
+   ```bash
+   cd apps/api
+   npx wrangler dev --local
+   ```
+3. Start the web UI:
+   ```bash
+   cd apps/web
+   npm run dev
+   ```
+4. Run the automated suites from the repo root:
+   ```bash
+   npm test
+   ```
+
+## Data sources & licenses
+
+| Provider | Attribution | Notes |
+|----------|-------------|-------|
+| OpenStreetMap tiles | © OpenStreetMap contributors | Visible on the map and in the attribution footer |
+| Nominatim | Geocoding by Nominatim (OpenStreetMap) | Used for location search |
+| Overpass API | POI search via Overpass API (OpenStreetMap) | Powers store discovery |
+| Open Food Facts | Data © Open Food Facts contributors | Drives product lookup and search |
+| Open Prices | Price data © Open Prices contributors | Provides historical price evidence |
+| Kroger API | Live prices via Kroger API (where available) | Optional overlay when credentials are configured |
+
+Browser requests surface the `x-request-id` header in every response so you can tie UI errors back to the worker logs.
+
+## Demo script
+
+1. Search for a location such as “Manhattan” to show stores on the map.
+2. Paste a UPC or search term to load product metadata; mention the attribution footer highlights Open Food Facts.
+3. Add 2–3 items to the cart, go to the Cart tab, and click “Compare prices.”
+4. Call attention to the attribution footer again—OpenStreetMap, Overpass, and Open Food Facts are always available.
+5. Trigger a failure (rate limit, offline provider, etc.) to show the friendly message and the `Request ID` inside it.
+6. Optionally hit the internal endpoints:
+   ```bash
+   curl -H "x-pricecart-internal: dev-internal-token" http://localhost:8787/api/internal/attributions
+   curl -H "x-pricecart-internal: dev-internal-token" http://localhost:8787/api/internal/metrics
+   ```
+   and point out the metrics/attribution data you can demo.
+
+## Release checklist
+
+- [x] Provider attributions are visible in the UI
+- [x] Internal `/api/internal/*` endpoints require `x-pricecart-internal`
+- [x] Provider calls respect timeouts, retries, and 429 handling
+- [x] Logs and responses include `request_id` for every request
+- [x] Metrics endpoint surface useful route/provider stats
+- [x] Request IDs appear on UI errors
+- [x] Keyboard navigation + status announcements behave across the primary flows
+- [x] CI passes (`npm test`)
+
+## Troubleshooting
+
+- No metrics yet? Make sure `METRICS_ENABLED=1`, hit a few API routes, and rerun `GET /api/internal/metrics`.
+- `/api/internal/*` still 401? Confirm `INTERNAL_TOKEN` is set and include `x-pricecart-internal`.
+- Provider errors in the UI? Look for the `Request ID` in the banner and search the API logs; the UI surfaces the same ID.
+- Rate limits? Wait a few seconds, the UI will show a polite “Provider is busy” message and you can retry.
+
+## Known limitations
+
+- Public OSM/Nominatim/Overpass services are capacity constrained; a self-hosted stack is recommended for heavy traffic.
+- Open Food Facts coverage varies by region and SKU; some lookups will fall back to manual entry.
+- Open Prices is best-effort and only covers the datasets it indexes.
+- Kroger live prices are gated behind credentials and regionally limited.
+</file>
+
 <file path="apps/api/migrations/0004_phase2_seed_products.sql">
 INSERT OR REPLACE INTO seed_meta (k, v) VALUES ('seed_products_version', 'phase2-v1');
 
@@ -3848,6 +3297,1526 @@ export function cors(allowedOrigin: string): MiddlewareHandler {
 }
 </file>
 
+<file path="apps/api/src/providers/kroger.ts">
+import { z } from "zod";
+import { isOpen, recordFailure, recordSuccess } from "../lib/circuitBreaker";
+import { fetchWithRetry, HttpError, RetryOptions, TimeoutError } from "../lib/http";
+import { noteProviderOutcome } from "../lib/providerMetrics";
+
+const PROVIDER = "kroger";
+
+function b64(s: string) {
+  const g: any = globalThis as any;
+  if (typeof g.btoa === "function") return g.btoa(s);
+  return Buffer.from(s, "utf8").toString("base64");
+}
+
+function toNumber(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function toCents(v: unknown): number | null {
+  const n = toNumber(v);
+  if (n === null) return null;
+  return Math.round(n * 100);
+}
+
+const RETRY_OPTIONS: RetryOptions = {
+  attempts: 3,
+  baseDelayMs: 250,
+  maxDelayMs: 2000,
+  retryOnStatuses: [429, 500, 502, 503, 504]
+};
+
+type ProviderEnv = {
+  DB: D1Database;
+  OUTBOUND_USER_AGENT?: string;
+  OUTBOUND_REFERER?: string;
+  METRICS_ENABLED?: string;
+  PROVIDER_TIMEOUT_MS?: string;
+};
+
+function getTimeoutMs(env: ProviderEnv) {
+  const parsed = Number(env.PROVIDER_TIMEOUT_MS ?? "6000");
+  return Number.isFinite(parsed) ? parsed : 6000;
+}
+
+function classifyError(err: unknown): string {
+  if (err instanceof TimeoutError) return "timeout";
+  if (err instanceof HttpError) {
+    if (err.status === 429) return "rate_limited";
+    if (err.status >= 500) return "http_5xx";
+    if (err.status >= 400) return "http_4xx";
+  }
+  if (err instanceof SyntaxError) return "parse_error";
+  return "other";
+}
+
+/** ---------------- Token ---------------- */
+const TokenResponseSchema = z
+  .object({
+    access_token: z.string(),
+    token_type: z.string().optional(),
+    expires_in: z.union([z.number(), z.string()]).optional(),
+    scope: z.string().optional()
+  })
+  .passthrough();
+
+export type KrogerToken = {
+  access_token: string;
+  expires_in_sec: number | null;
+  scope: string | null;
+};
+
+export function parseKrogerTokenResponse(json: unknown): KrogerToken {
+  const r = TokenResponseSchema.parse(json);
+  const exp = toNumber(r.expires_in);
+  return {
+    access_token: r.access_token,
+    expires_in_sec: exp === null ? null : Math.floor(exp),
+    scope: r.scope ?? null
+  };
+}
+
+/** ---------------- Locations ---------------- */
+const KrogerLocationSchema = z
+  .object({
+    locationId: z.string(),
+    name: z.string().optional().nullable(),
+    chain: z.string().optional().nullable(),
+    geolocation: z
+      .object({
+        latitude: z.union([z.number(), z.string()]).optional(),
+        longitude: z.union([z.number(), z.string()]).optional()
+      })
+      .optional()
+      .nullable(),
+    latitude: z.union([z.number(), z.string()]).optional(),
+    longitude: z.union([z.number(), z.string()]).optional()
+  })
+  .passthrough();
+
+const KrogerLocationsResponseSchema = z
+  .object({
+    data: z.array(KrogerLocationSchema).default([])
+  })
+  .passthrough();
+
+export type KrogerLocation = {
+  locationId: string;
+  name: string | null;
+  chain: string | null;
+  lat: number;
+  lon: number;
+};
+
+export function parseKrogerLocationsResponse(json: unknown): KrogerLocation[] {
+  const r = KrogerLocationsResponseSchema.parse(json);
+  const out: KrogerLocation[] = [];
+
+  for (const loc of r.data) {
+    const lat =
+      toNumber(loc.geolocation?.latitude) ??
+      toNumber(loc.latitude) ??
+      null;
+    const lon =
+      toNumber(loc.geolocation?.longitude) ??
+      toNumber(loc.longitude) ??
+      null;
+
+    if (lat === null || lon === null) continue;
+
+    out.push({
+      locationId: loc.locationId,
+      name: loc.name ?? null,
+      chain: loc.chain ?? null,
+      lat,
+      lon
+    });
+  }
+
+  return out;
+}
+
+/** ---------------- Product details ---------------- */
+const KrogerPriceSchema = z
+  .object({
+    regular: z.union([z.number(), z.string()]).optional(),
+    promo: z.union([z.number(), z.string()]).optional()
+  })
+  .passthrough();
+
+const KrogerItemSchema = z
+  .object({
+    price: KrogerPriceSchema.optional().nullable()
+  })
+  .passthrough();
+
+const KrogerProductSchema = z
+  .object({
+    upc: z.string().optional(),
+    items: z.array(KrogerItemSchema).optional().nullable()
+  })
+  .passthrough();
+
+const KrogerProductDetailsResponseSchema = z
+  .object({
+    data: z.union([KrogerProductSchema, z.array(KrogerProductSchema)]).optional()
+  })
+  .passthrough();
+
+export type KrogerProductPrice = {
+  upc: string;
+  price_cents: number | null;
+};
+
+export function parseKrogerProductDetailsResponse(json: unknown, upcFallback: string): KrogerProductPrice {
+  const r = KrogerProductDetailsResponseSchema.parse(json);
+  const data = Array.isArray(r.data) ? r.data[0] : r.data;
+  if (!data) return { upc: upcFallback, price_cents: null };
+
+  const upc = data.upc ?? upcFallback;
+  const item = data.items?.[0];
+  const price = item?.price ?? null;
+
+  const promo = price ? toCents(price.promo) : null;
+  const regular = price ? toCents(price.regular) : null;
+
+  return { upc, price_cents: promo ?? regular ?? null };
+}
+
+/** ---------------- HTTP calls (with circuit breaker) ---------------- */
+export async function fetchKrogerToken(
+  env: ProviderEnv,
+  opts: {
+    client_id: string;
+    client_secret: string;
+    token_url?: string;
+    scope?: string;
+    user_agent?: string;
+    referer?: string;
+  }
+): Promise<KrogerToken> {
+  if (await isOpen(env.DB, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
+  const enabled = env.METRICS_ENABLED === "1";
+  const tokenUrl = opts.token_url ?? "https://api.kroger.com/v1/connect/oauth2/token";
+  const scope = opts.scope ?? "product.compact";
+  const auth = b64(`${opts.client_id}:${opts.client_secret}`);
+  const timeoutMs = getTimeoutMs(env);
+
+  try {
+    const res = await fetchWithRetry(
+      tokenUrl,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${auth}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+          ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
+          ...(opts.referer ? { Referer: opts.referer } : {}),
+          ...(env.OUTBOUND_USER_AGENT && !opts.user_agent ? { "User-Agent": env.OUTBOUND_USER_AGENT } : {}),
+          ...(env.OUTBOUND_REFERER && !opts.referer ? { Referer: env.OUTBOUND_REFERER } : {})
+        },
+        body: new URLSearchParams({
+          grant_type: "client_credentials",
+          scope
+        }).toString()
+      },
+      { timeoutMs, retry: RETRY_OPTIONS, isIdempotent: true }
+    );
+
+    const text = await res.text();
+    if (!res.ok) {
+      throw new HttpError(`KROGER_TOKEN_HTTP_${res.status}: ${text.slice(0, 300)}`, res.status, tokenUrl);
+    }
+
+    const json = JSON.parse(text);
+    const parsed = parseKrogerTokenResponse(json);
+    await recordSuccess(env.DB, PROVIDER);
+    await noteProviderOutcome({ db: env.DB, enabled, provider: "kroger_token", outcome: "success" });
+    return parsed;
+  } catch (e) {
+    await noteProviderOutcome({
+      db: env.DB,
+      enabled,
+      provider: "kroger_token",
+      outcome: classifyError(e)
+    });
+    await recordFailure(env.DB, PROVIDER);
+    throw e;
+  }
+}
+
+export async function fetchKrogerLocations(
+  env: ProviderEnv,
+  opts: {
+    access_token: string;
+    base_url?: string;
+    lat: number;
+    lon: number;
+    radius_miles?: number;
+    limit?: number;
+    user_agent?: string;
+    referer?: string;
+  }
+): Promise<KrogerLocation[]> {
+  if (await isOpen(env.DB, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
+  const enabled = env.METRICS_ENABLED === "1";
+  const timeoutMs = getTimeoutMs(env);
+  const baseUrl = opts.base_url ?? "https://api.kroger.com/v1";
+  const radius = opts.radius_miles ?? 2;
+  const limit = opts.limit ?? 10;
+
+  const url = new URL(`${baseUrl}/locations`);
+  url.searchParams.set("filter.latLong.near", `${opts.lat},${opts.lon}`);
+  url.searchParams.set("filter.radiusInMiles", String(radius));
+  url.searchParams.set("filter.limit", String(limit));
+
+  try {
+    const res = await fetchWithRetry(
+      url.toString(),
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${opts.access_token}`,
+          Accept: "application/json",
+          ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
+          ...(opts.referer ? { Referer: opts.referer } : {}),
+          ...(env.OUTBOUND_USER_AGENT && !opts.user_agent ? { "User-Agent": env.OUTBOUND_USER_AGENT } : {}),
+          ...(env.OUTBOUND_REFERER && !opts.referer ? { Referer: env.OUTBOUND_REFERER } : {})
+        }
+      },
+      { timeoutMs, retry: RETRY_OPTIONS }
+    );
+
+    const text = await res.text();
+    if (!res.ok) {
+      throw new HttpError(`KROGER_LOCATIONS_HTTP_${res.status}: ${text.slice(0, 300)}`, res.status, url.toString());
+    }
+
+    const json = JSON.parse(text);
+    const parsed = parseKrogerLocationsResponse(json);
+    await recordSuccess(env.DB, PROVIDER);
+    await noteProviderOutcome({ db: env.DB, enabled, provider: "kroger_locations", outcome: "success" });
+    return parsed;
+  } catch (e) {
+    await noteProviderOutcome({
+      db: env.DB,
+      enabled,
+      provider: "kroger_locations",
+      outcome: classifyError(e)
+    });
+    await recordFailure(env.DB, PROVIDER);
+    throw e;
+  }
+}
+
+export async function fetchKrogerProductDetails(
+  env: ProviderEnv,
+  opts: {
+    access_token: string;
+    base_url?: string;
+    location_id: string;
+    upc: string;
+    user_agent?: string;
+    referer?: string;
+  }
+): Promise<KrogerProductPrice> {
+  if (await isOpen(env.DB, PROVIDER)) throw new Error("KROGER_CIRCUIT_OPEN");
+  const enabled = env.METRICS_ENABLED === "1";
+  const timeoutMs = getTimeoutMs(env);
+  const baseUrl = opts.base_url ?? "https://api.kroger.com/v1";
+  const url = new URL(`${baseUrl}/products/${encodeURIComponent(opts.upc)}`);
+  url.searchParams.set("filter.locationId", opts.location_id);
+
+  try {
+    const res = await fetchWithRetry(
+      url.toString(),
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${opts.access_token}`,
+          Accept: "application/json",
+          ...(opts.user_agent ? { "User-Agent": opts.user_agent } : {}),
+          ...(opts.referer ? { Referer: opts.referer } : {}),
+          ...(env.OUTBOUND_USER_AGENT && !opts.user_agent ? { "User-Agent": env.OUTBOUND_USER_AGENT } : {}),
+          ...(env.OUTBOUND_REFERER && !opts.referer ? { Referer: env.OUTBOUND_REFERER } : {})
+        }
+      },
+      { timeoutMs, retry: RETRY_OPTIONS }
+    );
+
+    const text = await res.text();
+    if (!res.ok) {
+      throw new HttpError(`KROGER_PRODUCT_HTTP_${res.status}: ${text.slice(0, 300)}`, res.status, url.toString());
+    }
+
+    const json = JSON.parse(text);
+    const parsed = parseKrogerProductDetailsResponse(json, opts.upc);
+    await recordSuccess(env.DB, PROVIDER);
+    await noteProviderOutcome({ db: env.DB, enabled, provider: "kroger_products", outcome: "success" });
+    return parsed;
+  } catch (e) {
+    await noteProviderOutcome({
+      db: env.DB,
+      enabled,
+      provider: "kroger_products",
+      outcome: classifyError(e)
+    });
+    await recordFailure(env.DB, PROVIDER);
+    throw e;
+  }
+}
+</file>
+
+<file path="apps/api/src/providers/nominatim.ts">
+import { isOpen, recordFailure, recordSuccess } from "../lib/circuitBreaker";
+import { fetchWithRetry, HttpError, RetryOptions, TimeoutError } from "../lib/http";
+import { noteProviderOutcome } from "../lib/providerMetrics";
+
+const PROVIDER = "nominatim";
+const RETRY_OPTIONS: RetryOptions = {
+  attempts: 3,
+  baseDelayMs: 250,
+  maxDelayMs: 2000,
+  retryOnStatuses: [429, 500, 502, 503, 504]
+};
+
+type ProviderEnv = {
+  DB: D1Database;
+  OUTBOUND_USER_AGENT?: string;
+  OUTBOUND_REFERER?: string;
+  METRICS_ENABLED?: string;
+  PROVIDER_TIMEOUT_MS?: string;
+};
+
+function getTimeoutMs(env: ProviderEnv) {
+  const parsed = Number(env.PROVIDER_TIMEOUT_MS ?? "6000");
+  return Number.isFinite(parsed) ? parsed : 6000;
+}
+
+function buildHeaders(env: ProviderEnv) {
+  return {
+    Accept: "application/json",
+    "User-Agent": env.OUTBOUND_USER_AGENT || "PriceCart/0.1 (phase6)",
+    Referer: env.OUTBOUND_REFERER || "https://example.invalid"
+  };
+}
+
+function classifyError(err: unknown): string {
+  if (err instanceof TimeoutError) return "timeout";
+  if (err instanceof HttpError) {
+    if (err.status === 429) return "rate_limited";
+    if (err.status >= 500) return "http_5xx";
+    if (err.status >= 400) return "http_4xx";
+  }
+  if (err instanceof SyntaxError) return "parse_error";
+  return "other";
+}
+
+async function performGet(env: ProviderEnv, url: string) {
+  const timeoutMs = getTimeoutMs(env);
+  const res = await fetchWithRetry(
+    url,
+    {
+      method: "GET",
+      headers: buildHeaders(env)
+    },
+    { timeoutMs, retry: RETRY_OPTIONS }
+  );
+
+  if (!res.ok) {
+    throw new HttpError(`Nominatim HTTP ${res.status}`, res.status, url);
+  }
+
+  return res;
+}
+
+export type GeocodeResult = { lat: number; lon: number; display_name?: string };
+
+export async function geocode(env: ProviderEnv, location: string): Promise<GeocodeResult> {
+  const provider = PROVIDER;
+  if (await isOpen(env.DB, provider)) throw new Error("PROVIDER_OPEN");
+  const enabled = env.METRICS_ENABLED === "1";
+
+  const url = new URL("https://nominatim.openstreetmap.org/search");
+  url.searchParams.set("q", location);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("limit", "1");
+
+  try {
+    const res = await performGet(env, url.toString());
+    const json = (await res.json()) as Array<{ lat: string; lon: string; display_name?: string }>;
+
+    if (!json[0]) {
+      await recordSuccess(env.DB, provider);
+      throw new Error("NOT_FOUND");
+    }
+
+    await recordSuccess(env.DB, provider);
+    await noteProviderOutcome({ db: env.DB, enabled, provider, outcome: "success" });
+    return {
+      lat: Number(json[0].lat),
+      lon: Number(json[0].lon),
+      display_name: json[0].display_name
+    };
+  } catch (e) {
+    await noteProviderOutcome({ db: env.DB, enabled, provider, outcome: classifyError(e) });
+    await recordFailure(env.DB, provider);
+    throw e;
+  }
+}
+</file>
+
+<file path="apps/api/src/providers/openFoodFacts.ts">
+import { z } from "zod";
+import { isOpen, recordFailure, recordSuccess } from "../lib/circuitBreaker";
+import { fetchWithRetry, HttpError, RetryOptions, TimeoutError } from "../lib/http";
+import { noteProviderOutcome } from "../lib/providerMetrics";
+
+export const OFF_ATTRIBUTION = {
+  text: "Data from Open Food Facts",
+  links: [
+    { label: "Open Food Facts", href: "https://world.openfoodfacts.org" },
+    { label: "API", href: "https://openfoodfacts.github.io/openfoodfacts-server/api/" }
+  ]
+};
+
+export type OffProductRaw = {
+  code: string;
+  product_name: string | null;
+  brands: string | null;
+  quantity: string | null;
+  image_front_url: string | null;
+  url: string | null;
+  last_modified_t: number | null;
+};
+
+const OffProductSchema = z
+  .object({
+    code: z.string().optional(),
+    product_name: z.string().optional(),
+    brands: z.string().optional(),
+    quantity: z.string().optional(),
+    image_front_url: z.string().url().optional(),
+    url: z.string().url().optional(),
+    last_modified_t: z.number().optional()
+  })
+  .passthrough();
+
+const OffLookupSchema = z
+  .object({
+    status: z.number(),
+    status_verbose: z.string().optional(),
+    product: OffProductSchema.optional()
+  })
+  .passthrough();
+
+const OffSearchSchema = z
+  .object({
+    count: z.number().optional(),
+    page: z.number().optional(),
+    page_size: z.number().optional(),
+    products: z.array(OffProductSchema).default([])
+  })
+  .passthrough();
+
+export function parseOffLookupResponse(json: unknown, upc: string): OffProductRaw {
+  const parsed = OffLookupSchema.safeParse(json);
+  if (!parsed.success) throw new Error("OFF_SCHEMA");
+
+  if (parsed.data.status !== 1 || !parsed.data.product) throw new Error("NOT_FOUND");
+
+  const p = parsed.data.product;
+  return {
+    code: String(p.code ?? upc),
+    product_name: p.product_name ?? null,
+    brands: p.brands ?? null,
+    quantity: p.quantity ?? null,
+    image_front_url: p.image_front_url ?? null,
+    url: p.url ?? null,
+    last_modified_t: p.last_modified_t ?? null
+  };
+}
+
+export function parseOffSearchResponse(json: unknown): {
+  total: number;
+  page: number;
+  page_size: number;
+  products: OffProductRaw[];
+} {
+  const parsed = OffSearchSchema.safeParse(json);
+  if (!parsed.success) throw new Error("OFF_SCHEMA");
+
+  const total = parsed.data.count ?? parsed.data.products.length;
+  const page = parsed.data.page ?? 1;
+  const page_size = parsed.data.page_size ?? parsed.data.products.length;
+
+  const products: OffProductRaw[] = parsed.data.products.map((p) => ({
+    code: String(p.code ?? ""),
+    product_name: p.product_name ?? null,
+    brands: p.brands ?? null,
+    quantity: p.quantity ?? null,
+    image_front_url: p.image_front_url ?? null,
+    url: p.url ?? null,
+    last_modified_t: p.last_modified_t ?? null
+  }));
+
+  return { total, page, page_size, products };
+}
+
+const PROVIDER = "openfoodfacts";
+const RETRY_OPTIONS: RetryOptions = {
+  attempts: 3,
+  baseDelayMs: 250,
+  maxDelayMs: 2000,
+  retryOnStatuses: [429, 500, 502, 503, 504]
+};
+
+type ProviderEnv = {
+  DB: D1Database;
+  OUTBOUND_USER_AGENT?: string;
+  OUTBOUND_REFERER?: string;
+  OFF_BASE_URL?: string;
+  METRICS_ENABLED?: string;
+  PROVIDER_TIMEOUT_MS?: string;
+};
+
+function getTimeoutMs(env: ProviderEnv) {
+  const parsed = Number(env.PROVIDER_TIMEOUT_MS ?? "6000");
+  return Number.isFinite(parsed) ? parsed : 6000;
+}
+
+function buildHeaders(env: ProviderEnv) {
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    "User-Agent": env.OUTBOUND_USER_AGENT || "PriceCart/0.1 (phase6)"
+  };
+  if (env.OUTBOUND_REFERER) {
+    headers.Referer = env.OUTBOUND_REFERER;
+  }
+  return headers;
+}
+
+function classifyError(err: unknown): string {
+  if (err instanceof TimeoutError) return "timeout";
+  if (err instanceof HttpError) {
+    if (err.status === 429) return "rate_limited";
+    if (err.status >= 500) return "http_5xx";
+    if (err.status >= 400) return "http_4xx";
+  }
+  if (err instanceof SyntaxError) return "parse_error";
+  return "other";
+}
+
+async function fetchJsonWithRetry(env: ProviderEnv, url: string) {
+  const timeoutMs = getTimeoutMs(env);
+  const res = await fetchWithRetry(
+    url,
+    {
+      method: "GET",
+      headers: buildHeaders(env)
+    },
+    { timeoutMs, retry: RETRY_OPTIONS }
+  );
+
+  if (!res.ok) {
+    throw new HttpError(`OFF_HTTP_${res.status}`, res.status, url);
+  }
+
+  return res.json();
+}
+
+export async function offLookupByUpc(env: ProviderEnv, upc: string): Promise<OffProductRaw> {
+  const provider = PROVIDER;
+  if (await isOpen(env.DB, provider)) throw new Error("PROVIDER_OPEN");
+  const enabled = env.METRICS_ENABLED === "1";
+
+  const base = (env.OFF_BASE_URL || "https://world.openfoodfacts.org").replace(/\/+$/, "");
+  const url = new URL(`${base}/api/v2/product/${encodeURIComponent(upc)}.json`);
+  url.searchParams.set("fields", "code,product_name,brands,quantity,image_front_url,url,last_modified_t");
+
+  try {
+    const json = await fetchJsonWithRetry(env, url.toString());
+    const product = parseOffLookupResponse(json, upc);
+    await recordSuccess(env.DB, provider);
+    await noteProviderOutcome({ db: env.DB, enabled, provider, outcome: "success" });
+    return product;
+  } catch (e) {
+    await noteProviderOutcome({ db: env.DB, enabled, provider, outcome: classifyError(e) });
+    await recordFailure(env.DB, provider);
+    throw e;
+  }
+}
+
+export async function offSearch(
+  env: ProviderEnv,
+  q: string,
+  page: number,
+  pageSize: number
+): Promise<{ total: number; page: number; page_size: number; products: OffProductRaw[] }> {
+  const provider = PROVIDER;
+  if (await isOpen(env.DB, provider)) throw new Error("PROVIDER_OPEN");
+  const enabled = env.METRICS_ENABLED === "1";
+
+  const base = (env.OFF_BASE_URL || "https://world.openfoodfacts.org").replace(/\/+$/, "");
+  const url = new URL(`${base}/api/v2/search`);
+  url.searchParams.set("search_terms", q);
+  url.searchParams.set("page", String(page));
+  url.searchParams.set("page_size", String(pageSize));
+  url.searchParams.set("fields", "code,product_name,brands,quantity,image_front_url,url,last_modified_t");
+
+  try {
+    const json = await fetchJsonWithRetry(env, url.toString());
+    const parsed = parseOffSearchResponse(json);
+    await recordSuccess(env.DB, provider);
+    await noteProviderOutcome({ db: env.DB, enabled, provider, outcome: "success" });
+    return { total: parsed.total, page: parsed.page, page_size: parsed.page_size, products: parsed.products };
+  } catch (e) {
+    await noteProviderOutcome({ db: env.DB, enabled, provider, outcome: classifyError(e) });
+    await recordFailure(env.DB, provider);
+    throw e;
+  }
+}
+</file>
+
+<file path="apps/api/src/providers/overpass.ts">
+import { isOpen, recordFailure, recordSuccess } from "../lib/circuitBreaker";
+import { fetchWithRetry, HttpError, RetryOptions, TimeoutError } from "../lib/http";
+import { noteProviderOutcome } from "../lib/providerMetrics";
+
+export type OverpassStore = {
+  external_id: string;
+  name: string;
+  lat: number;
+  lon: number;
+  tags: Record<string, string>;
+};
+
+const PROVIDER = "overpass";
+const ENDPOINT = "https://overpass-api.de/api/interpreter";
+const RETRY_OPTIONS: RetryOptions = {
+  attempts: 3,
+  baseDelayMs: 250,
+  maxDelayMs: 2000,
+  retryOnStatuses: [429, 500, 502, 503, 504]
+};
+
+type ProviderEnv = {
+  DB: D1Database;
+  OUTBOUND_USER_AGENT?: string;
+  OUTBOUND_REFERER?: string;
+  METRICS_ENABLED?: string;
+  PROVIDER_TIMEOUT_MS?: string;
+};
+
+function getTimeoutMs(env: ProviderEnv) {
+  const parsed = Number(env.PROVIDER_TIMEOUT_MS ?? "6000");
+  return Number.isFinite(parsed) ? parsed : 6000;
+}
+
+function buildHeaders(env: ProviderEnv) {
+  return {
+    "Content-Type": "application/x-www-form-urlencoded",
+    Accept: "application/json",
+    "User-Agent": env.OUTBOUND_USER_AGENT || "PriceCart/0.1 (phase6)",
+    Referer: env.OUTBOUND_REFERER || "https://example.invalid"
+  };
+}
+
+function classifyError(err: unknown): string {
+  if (err instanceof TimeoutError) return "timeout";
+  if (err instanceof HttpError) {
+    if (err.status === 429) return "rate_limited";
+    if (err.status >= 500) return "http_5xx";
+    if (err.status >= 400) return "http_4xx";
+  }
+  if (err instanceof SyntaxError) return "parse_error";
+  return "other";
+}
+
+async function performQuery(env: ProviderEnv, body: string) {
+  const timeoutMs = getTimeoutMs(env);
+  const res = await fetchWithRetry(
+    ENDPOINT,
+    {
+      method: "POST",
+      headers: buildHeaders(env),
+      body
+    },
+    { timeoutMs, retry: RETRY_OPTIONS, isIdempotent: true }
+  );
+
+  if (!res.ok) {
+    throw new HttpError(`Overpass HTTP ${res.status}`, res.status, ENDPOINT);
+  }
+
+  return res;
+}
+
+export async function queryNearbyStores(
+  env: ProviderEnv,
+  center: { lat: number; lon: number },
+  radiusM: number
+): Promise<OverpassStore[]> {
+  if (await isOpen(env.DB, PROVIDER)) throw new Error("PROVIDER_OPEN");
+  const enabled = env.METRICS_ENABLED === "1";
+
+  const query = `
+[out:json][timeout:25];
+(
+  node[shop=supermarket](around:${radiusM},${center.lat},${center.lon});
+  node[shop=convenience](around:${radiusM},${center.lat},${center.lon});
+  node[shop=greengrocer](around:${radiusM},${center.lat},${center.lon});
+);
+out body;
+`;
+
+  try {
+    const body = new URLSearchParams({ data: query }).toString();
+    const res = await performQuery(env, body);
+    const json = (await res.json()) as {
+      elements: Array<{ type: string; id: number; lat: number; lon: number; tags?: Record<string, string> }>;
+    };
+
+    const stores: OverpassStore[] = (json.elements || [])
+      .filter((e) => e.type === "node")
+      .map((e) => {
+        const tags = e.tags || {};
+        const name = tags.name || tags.brand || "Unnamed store";
+        return {
+          external_id: `osm:${e.type}/${e.id}`,
+          name,
+          lat: e.lat,
+          lon: e.lon,
+          tags
+        };
+      });
+
+    await recordSuccess(env.DB, PROVIDER);
+    await noteProviderOutcome({ db: env.DB, enabled, provider: PROVIDER, outcome: "success" });
+    return stores;
+  } catch (e) {
+    await noteProviderOutcome({ db: env.DB, enabled, provider: PROVIDER, outcome: classifyError(e) });
+    await recordFailure(env.DB, PROVIDER);
+    throw e;
+  }
+}
+</file>
+
+<file path="apps/api/src/services/krogerLivePrices.ts">
+import { cacheGet, cachePut } from "../lib/cache";
+import { distanceMeters } from "../lib/geo";
+import { takeToken } from "../lib/rateLimit";
+import { nowSec } from "../lib/time";
+import {
+  fetchKrogerLocations,
+  fetchKrogerProductDetails,
+  fetchKrogerToken,
+  type KrogerLocation
+} from "../providers/kroger";
+
+type EnvLike = {
+  DB: D1Database;
+  OUTBOUND_USER_AGENT?: string;
+  OUTBOUND_REFERER?: string;
+
+  KROGER_LIVE_PRICES_ENABLED?: string;
+  KROGER_CLIENT_ID?: string;
+  KROGER_CLIENT_SECRET?: string;
+  KROGER_BASE_URL?: string;
+  KROGER_TOKEN_URL?: string;
+  METRICS_ENABLED?: string;
+  PROVIDER_TIMEOUT_MS?: string;
+};
+
+export type LivePriceOverlayInput = {
+  session_id: string;
+  store: {
+    id: string;
+    name: string;
+    lat: number;
+    lon: number;
+    tags: Record<string, unknown>;
+  };
+  upcs: string[];
+  t: number;
+};
+
+export type LivePriceOverlayResult = {
+  prices_by_upc: Map<string, { price_cents: number; observed_at: number; confidence: number }>;
+  warnings: string[];
+};
+
+const MAX_UPCS_PER_QUOTE = 25;
+
+const TOKEN_CACHE_KEY = "kroger:token:product.compact";
+const TOKEN_MIN_TTL_SEC = 60;
+
+const PRICE_CACHE_TTL_SEC = 10 * 60; // 10 minutes
+const LOCATION_CACHE_MIN_FRESH_SEC = 90 * 24 * 60 * 60; // 90 days
+
+const LOCATION_RADIUS_MILES = 2;
+const MATCH_THRESHOLD_METERS = 700; // conservative match threshold
+
+// Budgets (per session)
+const RL_LOCATIONS = { capacity: 3, refillPerSec: 1 / 30, cost: 1 };
+const RL_PRODUCTS  = { capacity: 25, refillPerSec: 1 / 2, cost: 1 };
+const RL_TOKEN     = { capacity: 2, refillPerSec: 1 / 60, cost: 1 };
+
+function isEnabled(env: EnvLike) {
+  const v = (env.KROGER_LIVE_PRICES_ENABLED ?? "").toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+
+function hasCreds(env: EnvLike) {
+  return !!(env.KROGER_CLIENT_ID && env.KROGER_CLIENT_SECRET);
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let idx = 0;
+
+  const workers = new Array(Math.max(1, limit)).fill(null).map(async () => {
+    while (true) {
+      const i = idx++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i]);
+    }
+  });
+
+  await Promise.all(workers);
+  return out;
+}
+
+async function getAccessToken(env: EnvLike, session_id: string): Promise<string> {
+  const cached = await cacheGet<{ access_token: string; expires_at: number }>(env.DB, TOKEN_CACHE_KEY);
+  const now = nowSec();
+  if (cached && cached.expires_at > now + TOKEN_MIN_TTL_SEC) return cached.access_token;
+
+  const ok = await takeToken(env.DB, `kroger:${session_id}:token`, RL_TOKEN);
+  if (!ok) throw new Error("KROGER_RATE_LIMITED_TOKEN");
+
+    const token = await fetchKrogerToken(env, {
+      client_id: env.KROGER_CLIENT_ID!,
+      client_secret: env.KROGER_CLIENT_SECRET!,
+      token_url: env.KROGER_TOKEN_URL,
+      scope: "product.compact",
+      user_agent: env.OUTBOUND_USER_AGENT,
+      referer: env.OUTBOUND_REFERER
+    });
+
+  const ttl = Math.max(TOKEN_MIN_TTL_SEC, (token.expires_in_sec ?? 1800) - 60);
+  const payload = {
+    access_token: token.access_token,
+    expires_at: now + ttl
+  };
+  await cachePut(env.DB, TOKEN_CACHE_KEY, payload, ttl);
+
+  return token.access_token;
+}
+
+async function getMappedLocationId(env: EnvLike, store_id: string): Promise<string | null> {
+  const row = await env.DB.prepare(
+    `SELECT provider_location_id, verified_at
+     FROM store_provider_mappings
+     WHERE store_id = ? AND provider = 'kroger'
+     LIMIT 1`
+  )
+    .bind(store_id)
+    .first<{ provider_location_id: string; verified_at: number }>();
+
+  if (!row) return null;
+  if (nowSec() - row.verified_at < LOCATION_CACHE_MIN_FRESH_SEC) return row.provider_location_id;
+  return null;
+}
+
+async function upsertLocationId(
+  env: EnvLike,
+  store_id: string,
+  location_id: string,
+  match_method: string,
+  match_score: number
+) {
+  const t = nowSec();
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO store_provider_mappings
+      (store_id, provider, provider_location_id, match_method, match_score, created_at, verified_at)
+     VALUES (?, 'kroger', ?, ?, ?, COALESCE((SELECT created_at FROM store_provider_mappings WHERE store_id = ? AND provider='kroger'), ?), ?)`
+  )
+    .bind(store_id, location_id, match_method, match_score, store_id, t, t)
+    .run();
+}
+
+function pickBestLocation(store: LivePriceOverlayInput["store"], locations: KrogerLocation[]) {
+  let best: { location: KrogerLocation; dist_m: number } | null = null;
+  for (const loc of locations) {
+    const d = distanceMeters(store.lat, store.lon, loc.lat, loc.lon);
+    if (!best || d < best.dist_m) best = { location: loc, dist_m: d };
+  }
+  return best;
+}
+
+async function resolveLocationId(env: EnvLike, input: LivePriceOverlayInput): Promise<string | null> {
+  const memo = await getMappedLocationId(env, input.store.id);
+  if (memo) return memo;
+
+  const ok = await takeToken(env.DB, `kroger:${input.session_id}:locations`, RL_LOCATIONS);
+  if (!ok) return null;
+
+  const token = await getAccessToken(env, input.session_id);
+    const locations = await fetchKrogerLocations(env, {
+      access_token: token,
+      base_url: env.KROGER_BASE_URL,
+      lat: input.store.lat,
+      lon: input.store.lon,
+      radius_miles: LOCATION_RADIUS_MILES,
+      limit: 10,
+      user_agent: env.OUTBOUND_USER_AGENT,
+      referer: env.OUTBOUND_REFERER
+    });
+
+  const best = pickBestLocation(input.store, locations);
+  if (!best) return null;
+
+  if (best.dist_m > MATCH_THRESHOLD_METERS) return null;
+
+  const score = Math.max(0, 1 - best.dist_m / MATCH_THRESHOLD_METERS);
+  await upsertLocationId(env, input.store.id, best.location.locationId, "auto_nearest", score);
+  return best.location.locationId;
+}
+
+export async function getKrogerLivePriceOverlay(env: EnvLike, input: LivePriceOverlayInput): Promise<LivePriceOverlayResult> {
+  const warnings: string[] = [];
+  const prices_by_upc = new Map<string, { price_cents: number; observed_at: number; confidence: number }>();
+
+  if (!isEnabled(env)) return { prices_by_upc, warnings };
+  if (!hasCreds(env)) {
+    warnings.push("KROGER_MISCONFIGURED_MISSING_CREDS");
+    return { prices_by_upc, warnings };
+  }
+
+  const upcs = input.upcs.slice(0, MAX_UPCS_PER_QUOTE);
+
+  let locationId: string | null = null;
+  try {
+    locationId = await resolveLocationId(env, input);
+  } catch {
+    warnings.push("KROGER_UNAVAILABLE_LOCATION_LOOKUP");
+    return { prices_by_upc, warnings };
+  }
+  if (!locationId) return { prices_by_upc, warnings };
+
+  let token: string;
+  try {
+    token = await getAccessToken(env, input.session_id);
+  } catch {
+    warnings.push("KROGER_UNAVAILABLE_AUTH");
+    return { prices_by_upc, warnings };
+  }
+
+  const observed_at = nowSec();
+  let partial = false;
+
+  await mapLimit(upcs, 4, async (upc) => {
+    const cacheKey = `kroger:price:${locationId}:${upc}`;
+    const cached = await cacheGet<{ price_cents: number; observed_at: number }>(env.DB, cacheKey);
+
+    if (cached && Number.isFinite(cached.price_cents)) {
+      prices_by_upc.set(upc, { price_cents: cached.price_cents, observed_at: cached.observed_at, confidence: 0.95 });
+      return;
+    }
+
+    const ok = await takeToken(env.DB, `kroger:${input.session_id}:products`, RL_PRODUCTS);
+    if (!ok) {
+      partial = true;
+      return;
+    }
+
+    try {
+      const r = await fetchKrogerProductDetails(env, {
+        access_token: token,
+        base_url: env.KROGER_BASE_URL,
+        location_id: locationId!,
+        upc,
+        user_agent: env.OUTBOUND_USER_AGENT,
+        referer: env.OUTBOUND_REFERER
+      });
+
+      if (r.price_cents == null) {
+        partial = true;
+        return;
+      }
+
+      await cachePut(env.DB, cacheKey, { price_cents: r.price_cents, observed_at }, PRICE_CACHE_TTL_SEC);
+      prices_by_upc.set(upc, { price_cents: r.price_cents, observed_at, confidence: 0.95 });
+    } catch {
+      partial = true;
+    }
+  });
+
+  if (partial) warnings.push("KROGER_PARTIAL_OR_RATE_LIMITED");
+  return { prices_by_upc, warnings };
+}
+</file>
+
+<file path="apps/api/src/services/productSearch.ts">
+import { cacheGet, cachePut } from "../lib/cache";
+import { sha256Base64Url } from "../lib/hash";
+import { takeToken } from "../lib/rateLimit";
+
+const TTL_OFF_SEARCH_SEC = 60 * 60; // 1 hour cache
+const RL_OFF_SEARCH = { capacity: 10, refillPerSec: 1 / 6, cost: 1 }; // ~10/min per session
+
+type OffSearchResponse = {
+  products?: unknown[];
+  count?: number | string;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function toStringValue(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (typeof value === "number") return String(value);
+  return undefined;
+}
+
+function toNumberValue(value: unknown): number | undefined {
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+type EnvLike = {
+  DB: D1Database;
+  OUTBOUND_USER_AGENT?: string;
+  OUTBOUND_REFERER?: string;
+  OFF_BASE_URL?: string; // optional
+  METRICS_ENABLED?: string;
+  PROVIDER_TIMEOUT_MS?: string;
+};
+
+export type ProductSummary = {
+  code: string;
+  product_name?: string;
+  brands?: string;
+  quantity?: string;
+  image_url?: string;
+  nutriscore_grade?: string;
+};
+
+export type ProductSearchResponse = {
+  q: string;
+  page: number;
+  page_size: number;
+  total_count: number;
+  products: ProductSummary[];
+  attribution: {
+    text: string;
+    links: { label: string; href: string }[];
+  };
+};
+
+export async function productSearch(
+  env: EnvLike,
+  input: { q: string; page: number; page_size: number; session_id: string }
+): Promise<ProductSearchResponse> {
+  const q = input.q.trim();
+  const page = Math.max(1, input.page);
+  const pageSize = Math.min(Math.max(1, input.page_size), 50);
+
+  const cacheKey = `off:search:${await sha256Base64Url(
+    `${q.toLowerCase()}|p=${page}|s=${pageSize}`
+  )}`;
+
+  const cached = await cacheGet<ProductSearchResponse>(env.DB, cacheKey);
+  if (cached) return cached;
+
+  const ok = await takeToken(env.DB, `rl:${input.session_id}:off_search`, RL_OFF_SEARCH);
+  if (!ok) throw new Error("RATE_LIMIT_OFF_SEARCH");
+
+  const base = (env.OFF_BASE_URL || "https://world.openfoodfacts.org").replace(/\/+$/, "");
+  const url = new URL(`${base}/cgi/search.pl`);
+  url.searchParams.set("action", "process");
+  url.searchParams.set("search_terms", q);
+  url.searchParams.set("search_simple", "1");
+  url.searchParams.set("json", "1");
+  url.searchParams.set("page", String(page));
+  url.searchParams.set("page_size", String(pageSize));
+
+  const headers = new Headers();
+  // OFF asks for a custom User-Agent to identify your app. :contentReference[oaicite:2]{index=2}
+  headers.set("User-Agent", env.OUTBOUND_USER_AGENT || "PriceCart/0.1 (dev)");
+  if (env.OUTBOUND_REFERER) headers.set("Referer", env.OUTBOUND_REFERER);
+
+  const resp = await fetch(url.toString(), { headers });
+  if (resp.status === 429) throw new Error("RATE_LIMIT_OFF_REMOTE");
+  if (!resp.ok) throw new Error(`OFF_HTTP_${resp.status}`);
+
+  const rawData = await resp.json();
+  const data = isRecord(rawData) ? (rawData as OffSearchResponse) : {};
+  const productsRaw: unknown[] = Array.isArray(data.products) ? data.products : [];
+
+  const products: ProductSummary[] = productsRaw
+    .map((p) => {
+      if (!isRecord(p)) return null;
+      const code = toStringValue(p["code"])?.trim();
+      if (!code) return null;
+
+      return {
+        code,
+        product_name: toStringValue(p["product_name"]) ?? toStringValue(p["product_name_en"]),
+        brands: toStringValue(p["brands"]),
+        quantity: toStringValue(p["quantity"]),
+        image_url: toStringValue(p["image_url"]),
+        nutriscore_grade: toStringValue(p["nutriscore_grade"])
+      } satisfies ProductSummary;
+    })
+    .filter(Boolean) as ProductSummary[];
+
+  const out: ProductSearchResponse = {
+    q,
+    page,
+    page_size: pageSize,
+    total_count: toNumberValue(data.count) ?? products.length,
+    products,
+    attribution: {
+      text: "Data from Open Food Facts",
+      links: [{ label: "Open Food Facts", href: "https://world.openfoodfacts.org/" }]
+    }
+  };
+
+  await cachePut(env.DB, cacheKey, out, TTL_OFF_SEARCH_SEC);
+  return out;
+}
+</file>
+
+<file path="apps/api/src/services/storeDiscovery.ts">
+import type { StoreSearchResponse } from "@pricecart/shared";
+import { cacheGet, cachePut } from "../lib/cache";
+import { distanceMeters } from "../lib/geo";
+import { sha256Base64Url } from "../lib/hash";
+import { takeToken } from "../lib/rateLimit";
+import { nowSec } from "../lib/time";
+import { geocode } from "../providers/nominatim";
+import { queryNearbyStores } from "../providers/overpass";
+
+const TTL_GEOCODE_SEC = 60 * 60 * 24 * 30; // 30 days
+const TTL_STORES_SEC = 60 * 60 * 24;      // 1 day
+
+// Budgets (demo-friendly, provider-friendly)
+const RL_GEOCODE = { capacity: 10, refillPerSec: 1 / 10, cost: 1 };   // ~10/min max per session
+const RL_OVERPASS = { capacity: 10, refillPerSec: 1 / 30, cost: 1 };  // ~10/5min max per session
+
+export async function storeSearch(
+  env: {
+    DB: D1Database;
+    OUTBOUND_USER_AGENT?: string;
+    OUTBOUND_REFERER?: string;
+    METRICS_ENABLED?: string;
+    PROVIDER_TIMEOUT_MS?: string;
+  },
+  input: { location: string; radius_m: number; session_id: string }
+): Promise<StoreSearchResponse> {
+  const radius = Math.min(Math.max(input.radius_m, 250), 20000); // clamp 250m..20km
+
+  // 1) Geocode with caching + rate limit
+  const locNorm = input.location.trim().toLowerCase();
+  const geoKey = `geo:${await sha256Base64Url(locNorm)}`;
+  let center = await cacheGet<{ lat: number; lon: number }>(env.DB, geoKey);
+
+  if (!center) {
+    const ok = await takeToken(env.DB, `rl:${input.session_id}:nominatim`, RL_GEOCODE);
+    if (!ok) throw new Error("RATE_LIMIT_GEOCODE");
+
+    try {
+      const g = await geocode(env, input.location);
+      center = { lat: g.lat, lon: g.lon };
+      await cachePut(env.DB, geoKey, center, TTL_GEOCODE_SEC);
+    } catch (geocodeErr) {
+      try {
+        const fallback = await seedResponse(env, radius);
+        console.log(
+          JSON.stringify({
+            level: "warn",
+            message: "geocode failed, falling back to seeded stores",
+            err: String(geocodeErr)
+          })
+        );
+        return fallback;
+      } catch {
+        throw geocodeErr;
+      }
+    }
+  }
+
+  // 2) Store query with caching + rate limit + fallback
+  const storesKey = `stores:${await sha256Base64Url(
+    `${center.lat.toFixed(3)},${center.lon.toFixed(3)}:r=${radius}`
+  )}`;
+
+  const cached = await cacheGet<{ stores: StoreSearchResponse["stores"] }>(env.DB, storesKey);
+  if (cached?.stores?.length) {
+    return {
+      center,
+      radius_m: radius,
+      data_mode: "cache",
+      stores: cached.stores,
+      attribution: osmAttribution()
+    };
+  }
+
+  // Try live Overpass, else seed fallback.
+  try {
+    const ok = await takeToken(env.DB, `rl:${input.session_id}:overpass`, RL_OVERPASS);
+    if (!ok) throw new Error("RATE_LIMIT_OVERPASS");
+
+    const raw = await queryNearbyStores(env, center, radius);
+
+    const stores = raw
+      .map((s) => ({
+        id: s.external_id,
+        name: s.name,
+        lat: s.lat,
+        lon: s.lon,
+        distance_m: Math.round(distanceMeters(center, { lat: s.lat, lon: s.lon })),
+        tags: s.tags
+      }))
+      .sort((a, b) => a.distance_m - b.distance_m)
+      .slice(0, 50);
+
+    await cachePut(env.DB, storesKey, { stores }, TTL_STORES_SEC);
+
+    // Opportunistic upsert into stores table (useful later, not required to return)
+    const t = nowSec();
+    const stmt = env.DB.prepare(
+      "INSERT OR REPLACE INTO stores (id, source, external_id, name, lat, lon, tags_json, last_seen_at) VALUES (?, 'osm', ?, ?, ?, ?, ?, ?)"
+    );
+    const batch = stores.map((st) =>
+      stmt.bind(st.id, st.id, st.name, st.lat, st.lon, JSON.stringify(st.tags ?? {}), t)
+    );
+    await env.DB.batch(batch);
+
+    return {
+      center,
+      radius_m: radius,
+      data_mode: "live",
+      stores,
+      attribution: osmAttribution()
+    };
+  } catch {
+    return seedResponse(env, radius, center);
+  }
+}
+
+function safeJson(s: string | null | undefined): Record<string, string> {
+  if (!s) return {};
+  try {
+    return JSON.parse(s) as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+function osmAttribution() {
+  return {
+    text: "© OpenStreetMap contributors",
+    links: [{ label: "OpenStreetMap", href: "https://www.openstreetmap.org/copyright" }]
+  };
+}
+
+async function seedResponse(
+  env: { DB: D1Database },
+  radius: number,
+  centerOverride?: { lat: number; lon: number }
+): Promise<StoreSearchResponse> {
+  const seed = await env.DB
+    .prepare("SELECT id, name, lat, lon, tags_json FROM stores WHERE source = 'seed'")
+    .all<{ id: string; name: string; lat: number; lon: number; tags_json: string }>();
+
+  const rows = seed.results || [];
+  const center =
+    centerOverride ?? (rows.length ? centerFromSeedRows(rows) : null);
+
+  if (!center) throw new Error("NO_SEED_STORES");
+
+  const stores = rows
+    .map((s) => ({
+      id: s.id,
+      name: s.name,
+      lat: s.lat,
+      lon: s.lon,
+      distance_m: Math.round(distanceMeters(center, { lat: s.lat, lon: s.lon })),
+      tags: safeJson(s.tags_json)
+    }))
+    .sort((a, b) => a.distance_m - b.distance_m);
+
+  return {
+    center,
+    radius_m: radius,
+    data_mode: "seed",
+    stores,
+    attribution: osmAttribution()
+  };
+}
+
+function centerFromSeedRows(rows: Array<{ lat: number; lon: number }>) {
+  if (!rows.length) return null;
+
+  const { lat, lon } = rows.reduce(
+    (acc, row) => {
+      acc.lat += row.lat;
+      acc.lon += row.lon;
+      return acc;
+    },
+    { lat: 0, lon: 0 }
+  );
+
+  return { lat: lat / rows.length, lon: lon / rows.length };
+}
+</file>
+
+<file path="apps/api/vite.config.ts">
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+
+// https://vite.dev/config/
+export default defineConfig(async ({ mode }) => {
+  // Vitest runs Vite in "test" mode and sets VITEST in the config process env.
+  const isVitest = !!process.env.VITEST || mode === "test";
+  const plugins = [react()];
+
+  if (!isVitest) {
+    const { cloudflare } = await import("@cloudflare/vite-plugin");
+    plugins.push(cloudflare());
+  }
+
+  return { plugins };
+});
+</file>
+
+<file path="apps/api/wrangler.jsonc">
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "api",
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-12-25",
+
+  "observability": { "enabled": true },
+
+  "vars": {
+    "OUTBOUND_USER_AGENT": "PriceCart/0.1 (contact: you@example.com)",
+    "OUTBOUND_REFERER": "http://localhost:5173",
+    "OFF_BASE_URL": "https://world.openfoodfacts.org",
+    "INTERNAL_TOKEN": "dev-internal-token",
+    "METRICS_ENABLED": "1",
+    "METRICS_SAMPLE_RATE": "1",
+    "PROVIDER_TIMEOUT_MS": "6000"
+  },
+
+  "assets": {
+    "not_found_handling": "single-page-application",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/health", "/stores/*", "/products/*"]
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "pricecart",
+      "database_id": "f0f7e12d-54da-4aa0-a94e-d84a80a71169"
+    }
+  ]
+}
+</file>
+
+<file path="apps/web/.env.example">
+VITE_API_BASE_URL=http://localhost:8787
+VITE_API_BASE_URL=http://localhost:8787/api
+</file>
+
+<file path="apps/web/package.json">
+{
+  "name": "web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@pricecart/shared": "file:../../packages/shared",
+    "leaflet": "1.9.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-leaflet": "5.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/leaflet": "1.9.21",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "eslint": "^9.39.1",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.4.24",
+    "globals": "^16.5.0",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.46.4",
+    "vite": "^7.2.4",
+    "vitest": "^4.0.16"
+  }
+}
+</file>
+
+<file path="package.json">
+{
+  "name": "pricecart",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run -ws --if-present dev",
+    "test": "npm run -ws --if-present test",
+    "lint": "npm run -ws --if-present lint",
+    "typecheck": "npm run -ws --if-present typecheck",
+    "build": "npm run -ws --if-present build"
+  },
+  "dependencies": {
+    "hono": "4.11.3",
+    "zod": "4.2.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20251225.0",
+    "@cloudflare/vite-plugin": "1.19.0",
+    "@types/node": "25.0.3",
+    "miniflare": "4.20251217.0",
+    "vitest": "4.0.16"
+  }
+}
+</file>
+
 <file path="apps/api/src/services/pricing.ts">
 import type { CartQuoteResponse, EvidenceType, FreshnessBucket, PriceSource } from "@pricecart/shared";
 import { takeToken } from "../lib/rateLimit";
@@ -3864,6 +4833,8 @@ type EnvLike = {
   KROGER_CLIENT_SECRET?: string;
   KROGER_BASE_URL?: string;
   KROGER_TOKEN_URL?: string;
+  METRICS_ENABLED?: string;
+  PROVIDER_TIMEOUT_MS?: string;
 };
 
 const RL_QUOTE = { capacity: 60, refillPerSec: 1 / 2, cost: 1 };   // ~60/min/session
@@ -4196,99 +5167,22 @@ export type Env = {
   KROGER_CLIENT_SECRET?: string; // secret
   KROGER_BASE_URL?: string; // optional, default "https://api.kroger.com/v1"
   KROGER_TOKEN_URL?: string; // optional, default "https://api.kroger.com/v1/connect/oauth2/token"
+
+  // Phase 6 – internal + observability
+  INTERNAL_TOKEN?: string; // required for /internal/*
+  METRICS_ENABLED?: string; // "1" enables metrics writes
+  METRICS_SAMPLE_RATE?: string; // "1" = 100%, "0.1" = 10%
+
+  // Phase 6 – resilience defaults
+  PROVIDER_TIMEOUT_MS?: string; // e.g. "6000"
 };
 </file>
 
-<file path="apps/api/vite.config.ts">
-import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
-
-// https://vite.dev/config/
-export default defineConfig(async ({ mode }) => {
-  // Vitest runs Vite in "test" mode and sets VITEST in the config process env.
-  const isVitest = !!process.env.VITEST || mode === "test";
-  const plugins = [react()];
-
-  if (!isVitest) {
-    const { cloudflare } = await import("@cloudflare/vite-plugin");
-    plugins.push(cloudflare());
-  }
-
-  return { plugins };
-});
-</file>
-
-<file path="apps/web/.env.example">
-VITE_API_BASE_URL=http://localhost:8787
-VITE_API_BASE_URL=http://localhost:8787/api
-</file>
-
-<file path="apps/web/package.json">
-{
-  "name": "web",
-  "private": true,
-  "version": "0.0.0",
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
-    "lint": "eslint .",
-    "preview": "vite preview",
-    "test": "vitest run"
-  },
-  "dependencies": {
-    "@pricecart/shared": "file:../../packages/shared",
-    "leaflet": "1.9.4",
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "react-leaflet": "5.0.0"
-  },
-  "devDependencies": {
-    "@eslint/js": "^9.39.1",
-    "@types/leaflet": "1.9.21",
-    "@types/node": "^24.10.1",
-    "@types/react": "^19.2.5",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^5.1.1",
-    "eslint": "^9.39.1",
-    "eslint-plugin-react-hooks": "^7.0.1",
-    "eslint-plugin-react-refresh": "^0.4.24",
-    "globals": "^16.5.0",
-    "typescript": "~5.9.3",
-    "typescript-eslint": "^8.46.4",
-    "vite": "^7.2.4",
-    "vitest": "^4.0.16"
-  }
-}
-</file>
-
-<file path="package.json">
-{
-  "name": "pricecart",
-  "private": true,
-  "workspaces": [
-    "apps/*",
-    "packages/*"
-  ],
-  "scripts": {
-    "dev": "npm run -ws --if-present dev",
-    "test": "npm run -ws --if-present test",
-    "lint": "npm run -ws --if-present lint",
-    "typecheck": "npm run -ws --if-present typecheck",
-    "build": "npm run -ws --if-present build"
-  },
-  "dependencies": {
-    "hono": "4.11.3",
-    "zod": "4.2.1"
-  },
-  "devDependencies": {
-    "@cloudflare/workers-types": "4.20251225.0",
-    "@cloudflare/vite-plugin": "1.19.0",
-    "@types/node": "25.0.3",
-    "miniflare": "4.20251217.0",
-    "vitest": "4.0.16"
-  }
-}
+<file path="packages/shared/src/index.ts">
+export * from "./cart.js";
+export * from "./pricing.js";
+export * from "./product.js";
+export * from "./store.js";
 </file>
 
 <file path="apps/api/src/index.ts">
@@ -4298,6 +5192,8 @@ import { z } from "zod";
 import type { Env } from "./env";
 import { cors } from "./middleware/cors";
 import { securityHeaders } from "./middleware/security";
+import { internalRoutes } from "./routes/internal";
+import { observabilityMiddleware } from "./middleware/observability";
 import { addCartItem, clearCart, getCart, removeCartItem, setCartItemQuantity } from "./services/cart";
 import { quoteCart, submitPrice } from "./services/pricing";
 import { productSearch } from "./services/productSearch";
@@ -4308,8 +5204,27 @@ const app = new Hono<{ Bindings: Env }>();
 // Adjust to your Pages domain once known
 const ALLOWED_ORIGIN = "http://localhost:5173";
 
+app.use("*", observabilityMiddleware);
 app.use("*", securityHeaders());
 app.use("*", cors(ALLOWED_ORIGIN));
+
+function buildErrorPayload(c: any, code: string, message?: string, details?: unknown) {
+  const error: Record<string, unknown> = {
+    code,
+    message: message ?? code,
+    request_id: c.get?.("request_id") ?? undefined
+  };
+
+  if (details !== undefined) {
+    error.details = details;
+  }
+
+  return { error };
+}
+
+function respondError(c: any, code: string, status: number, message?: string, details?: unknown) {
+  return c.json(buildErrorPayload(c, code, message, details), status);
+}
 
 app.get("/health", (c) => c.json({ ok: true }));
 const SessionIdSchema = z.string().min(1).max(128);
@@ -4350,7 +5265,13 @@ app.get("/stores/search", async (c) => {
   });
 
   if (!parsed.success) {
-    return c.json({ error: "INVALID_INPUT", details: parsed.error.flatten() }, 400);
+    return respondError(
+      c,
+      "INVALID_INPUT",
+      400,
+      "Invalid store search parameters",
+      parsed.error.flatten()
+    );
   }
 
   const sessionId = c.req.header("x-pricecart-session") || "anon";
@@ -4391,8 +5312,12 @@ app.get("/stores/search", async (c) => {
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
 
-    if (msg.includes("RATE_LIMIT")) return c.json({ error: "RATE_LIMITED" }, 429);
-    if (msg.includes("NOT_FOUND")) return c.json({ error: "NOT_FOUND" }, 404);
+    if (msg.includes("RATE_LIMIT")) {
+      return respondError(c, "RATE_LIMITED", 429, "Rate limited while searching stores");
+    }
+    if (msg.includes("NOT_FOUND")) {
+      return respondError(c, "NOT_FOUND", 404, "No stores found for that location");
+    }
 
     console.log(
       JSON.stringify({
@@ -4404,7 +5329,7 @@ app.get("/stores/search", async (c) => {
       })
     );
 
-    return c.json({ error: "INTERNAL_ERROR" }, 500);
+    return respondError(c, "INTERNAL_ERROR", 500, "Store search failed");
   }
 });
 
@@ -4416,7 +5341,13 @@ app.get("/products/search", async (c) => {
   });
 
   if (!parsed.success) {
-    return c.json({ error: "INVALID_INPUT", details: parsed.error.flatten() }, 400);
+    return respondError(
+      c,
+      "INVALID_INPUT",
+      400,
+      "Invalid product search parameters",
+      parsed.error.flatten()
+    );
   }
 
   const sessionId = c.req.header("x-pricecart-session") || "anon";
@@ -4448,7 +5379,9 @@ app.get("/products/search", async (c) => {
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
 
-    if (msg.includes("RATE_LIMIT")) return c.json({ error: "RATE_LIMITED" }, 429);
+    if (msg.includes("RATE_LIMIT")) {
+      return respondError(c, "RATE_LIMITED", 429, "Product search is being rate limited");
+    }
 
     console.log(
       JSON.stringify({
@@ -4460,7 +5393,7 @@ app.get("/products/search", async (c) => {
       })
     );
 
-    return c.json({ error: "INTERNAL_ERROR" }, 500);
+    return respondError(c, "INTERNAL_ERROR", 500, "Product search failed");
   }
 });
 
@@ -4471,10 +5404,10 @@ app.get("/cart", async (c) => {
     return c.json(cart);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return c.json(
-      { error: msg === "MISSING_SESSION" ? "MISSING_SESSION" : "INTERNAL_ERROR" },
-      msg === "MISSING_SESSION" ? 401 : 500
-    );
+    if (msg === "MISSING_SESSION") {
+      return respondError(c, "MISSING_SESSION", 401, "Session header missing");
+    }
+    return respondError(c, "INTERNAL_ERROR", 500, "Unable to load cart");
   }
 });
 
@@ -4483,18 +5416,20 @@ app.post("/cart/items", async (c) => {
     const session_id = requireSession(c);
     const body = await c.req.json();
     const parsed = CartAddItemRequestSchema.safeParse(body);
-    if (!parsed.success) return c.json({ error: "INVALID_INPUT" }, 400);
+    if (!parsed.success) {
+      return respondError(c, "INVALID_INPUT", 400, "Invalid cart item payload");
+    }
 
     const cart = await addCartItem(c.env, { session_id, ...parsed.data });
     return c.json(cart);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
-    if (msg === "PRODUCT_NOT_FOUND") return c.json({ error: "PRODUCT_NOT_FOUND" }, 404);
-    if (msg === "CART_TOO_LARGE") return c.json({ error: "CART_TOO_LARGE" }, 413);
-    if (msg === "QUANTITY_TOO_LARGE") return c.json({ error: "QUANTITY_TOO_LARGE" }, 400);
-    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
-    return c.json({ error: "INTERNAL_ERROR" }, 500);
+    if (msg === "MISSING_SESSION") return respondError(c, "MISSING_SESSION", 401, "Session header missing");
+    if (msg === "PRODUCT_NOT_FOUND") return respondError(c, "PRODUCT_NOT_FOUND", 404, "Product not found");
+    if (msg === "CART_TOO_LARGE") return respondError(c, "CART_TOO_LARGE", 413, "Cart has too many items");
+    if (msg === "QUANTITY_TOO_LARGE") return respondError(c, "QUANTITY_TOO_LARGE", 400, "Requested quantity too large");
+    if (msg === "RATE_LIMITED") return respondError(c, "RATE_LIMITED", 429, "Rate limited while modifying cart");
+    return respondError(c, "INTERNAL_ERROR", 500, "Unable to add item to cart");
   }
 });
 
@@ -4504,16 +5439,24 @@ app.patch("/cart/items/:upc", async (c) => {
     const upc = c.req.param("upc");
     const body = await c.req.json();
     const parsed = CartSetItemRequestSchema.safeParse(body);
-    if (!parsed.success) return c.json({ error: "INVALID_INPUT" }, 400);
+    if (!parsed.success) {
+      return respondError(c, "INVALID_INPUT", 400, "Invalid quantity payload");
+    }
 
     const cart = await setCartItemQuantity(c.env, { session_id, upc, quantity: parsed.data.quantity });
     return c.json(cart);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
-    if (msg === "QUANTITY_TOO_LARGE") return c.json({ error: "QUANTITY_TOO_LARGE" }, 400);
-    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
-    return c.json({ error: "INTERNAL_ERROR" }, 500);
+    if (msg === "MISSING_SESSION") {
+      return respondError(c, "MISSING_SESSION", 401, "Session header missing");
+    }
+    if (msg === "QUANTITY_TOO_LARGE") {
+      return respondError(c, "QUANTITY_TOO_LARGE", 400, "Requested quantity too large");
+    }
+    if (msg === "RATE_LIMITED") {
+      return respondError(c, "RATE_LIMITED", 429, "Rate limited while updating cart");
+    }
+    return respondError(c, "INTERNAL_ERROR", 500, "Unable to update cart item");
   }
 });
 
@@ -4525,9 +5468,13 @@ app.delete("/cart/items/:upc", async (c) => {
     return c.json(cart);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
-    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
-    return c.json({ error: "INTERNAL_ERROR" }, 500);
+    if (msg === "MISSING_SESSION") {
+      return respondError(c, "MISSING_SESSION", 401, "Session header missing");
+    }
+    if (msg === "RATE_LIMITED") {
+      return respondError(c, "RATE_LIMITED", 429, "Rate limited while deleting cart item");
+    }
+    return respondError(c, "INTERNAL_ERROR", 500, "Unable to remove cart item");
   }
 });
 
@@ -4538,9 +5485,13 @@ app.post("/cart/clear", async (c) => {
     return c.json(cart);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
-    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
-    return c.json({ error: "INTERNAL_ERROR" }, 500);
+    if (msg === "MISSING_SESSION") {
+      return respondError(c, "MISSING_SESSION", 401, "Session header missing");
+    }
+    if (msg === "RATE_LIMITED") {
+      return respondError(c, "RATE_LIMITED", 429, "Rate limited while clearing cart");
+    }
+    return respondError(c, "INTERNAL_ERROR", 500, "Unable to clear cart");
   }
 });
 
@@ -4549,7 +5500,9 @@ app.post("/cart/quote", async (c) => {
     const session_id = requireSession(c);
     const body = await c.req.json();
     const parsed = CartQuoteRequestSchema.safeParse(body);
-    if (!parsed.success) return c.json({ error: "INVALID_INPUT" }, 400);
+    if (!parsed.success) {
+      return respondError(c, "INVALID_INPUT", 400, "Invalid cart quote payload");
+    }
 
     const res = await quoteCart(c.env, { session_id, store_ids: parsed.data.store_ids });
 
@@ -4567,9 +5520,13 @@ app.post("/cart/quote", async (c) => {
     return c.json(res);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
-    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
-    return c.json({ error: "INTERNAL_ERROR" }, 500);
+    if (msg === "MISSING_SESSION") {
+      return respondError(c, "MISSING_SESSION", 401, "Session header missing");
+    }
+    if (msg === "RATE_LIMITED") {
+      return respondError(c, "RATE_LIMITED", 429, "Rate limited while quoting cart");
+    }
+    return respondError(c, "INTERNAL_ERROR", 500, "Unable to generate cart quote");
   }
 });
 
@@ -4578,7 +5535,9 @@ app.post("/prices/submit", async (c) => {
     const session_id = requireSession(c);
     const body = await c.req.json();
     const parsed = PriceSubmitRequestSchema.safeParse(body);
-    if (!parsed.success) return c.json({ error: "INVALID_INPUT" }, 400);
+    if (!parsed.success) {
+      return respondError(c, "INVALID_INPUT", 400, "Invalid price submission payload");
+    }
 
     const out = await submitPrice(c.env, {
       session_id,
@@ -4605,15 +5564,28 @@ app.post("/prices/submit", async (c) => {
     return c.json({ ok: true, snapshot_id: out.snapshot_id });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg === "MISSING_SESSION") return c.json({ error: "MISSING_SESSION" }, 401);
-    if (msg === "RATE_LIMITED") return c.json({ error: "RATE_LIMITED" }, 429);
-    if (msg === "STORE_NOT_FOUND") return c.json({ error: "STORE_NOT_FOUND" }, 404);
-    if (msg === "PRODUCT_NOT_FOUND") return c.json({ error: "PRODUCT_NOT_FOUND" }, 404);
-    if (msg === "OUTLIER_PRICE") return c.json({ error: "OUTLIER_PRICE" }, 422);
-    if (msg === "OBSERVED_AT_IN_FUTURE") return c.json({ error: "OBSERVED_AT_IN_FUTURE" }, 400);
-    return c.json({ error: "INTERNAL_ERROR" }, 500);
+    if (msg === "MISSING_SESSION") {
+      return respondError(c, "MISSING_SESSION", 401, "Session header missing");
+    }
+    if (msg === "RATE_LIMITED") {
+      return respondError(c, "RATE_LIMITED", 429, "Rate limited while submitting price");
+    }
+    if (msg === "STORE_NOT_FOUND") {
+      return respondError(c, "STORE_NOT_FOUND", 404, "Store not found");
+    }
+    if (msg === "PRODUCT_NOT_FOUND") {
+      return respondError(c, "PRODUCT_NOT_FOUND", 404, "Product not found");
+    }
+    if (msg === "OUTLIER_PRICE") {
+      return respondError(c, "OUTLIER_PRICE", 422, "Price appears to be an outlier");
+    }
+    if (msg === "OBSERVED_AT_IN_FUTURE") {
+      return respondError(c, "OBSERVED_AT_IN_FUTURE", 400, "Observed timestamp is in the future");
+    }
+    return respondError(c, "INTERNAL_ERROR", 500, "Unable to submit price");
   }
 });
+app.route("/internal", internalRoutes);
 
 export default app;
 </file>
@@ -4640,24 +5612,67 @@ function apiBase(): string {
   return (import.meta as any).env?.VITE_API_BASE_URL ?? "http://localhost:8787/api";
 }
 
-async function fetchJson<T>(url: string, init: FetchJsonInit = {}): Promise<T> {
+export class ApiError extends Error {
+  constructor(
+    public readonly code: string,
+    public readonly requestId: string | null,
+    message: string
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+function newRequestId() {
+  return crypto.randomUUID();
+}
+
+async function apiFetch<T>(url: string, init: FetchJsonInit = {}) {
+  const requestId = newRequestId();
   const headers = new Headers(init.headers);
   headers.set("x-pricecart-session", getSessionId());
+  headers.set("x-request-id", requestId);
 
-  let body: BodyInit | undefined = undefined;
   if (init.json !== undefined) {
     headers.set("content-type", "application/json");
-    body = JSON.stringify(init.json);
   }
 
-  const res = await fetch(url, { ...init, headers, body });
+  const body: BodyInit | undefined =
+    init.json !== undefined ? JSON.stringify(init.json) : init.body;
+
+  const { json: _unused, ...rest } = init;
+  const res = await fetch(url, { ...rest, headers, body });
+
+  const text = await res.text();
+  let parsed: unknown = null;
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = null;
+    }
+  }
+
+  const serverRequestId = res.headers.get("x-request-id") || requestId;
 
   if (!res.ok) {
-    const payload = await res.json().catch(() => ({}));
-    throw new Error(payload?.error || `HTTP_${res.status}`);
+    const errorPayload =
+      parsed && typeof parsed === "object" && "error" in parsed ? (parsed as any).error : null;
+    const code = (errorPayload?.code as string) ?? `HTTP_${res.status}`;
+    const message =
+      (errorPayload?.message as string) ??
+      (errorPayload?.code as string) ??
+      `HTTP_${res.status}`;
+    const requestIdFromPayload = (errorPayload?.request_id as string) ?? serverRequestId;
+    throw new ApiError(code, requestIdFromPayload ?? null, message);
   }
 
-  return (await res.json()) as T;
+  return { data: parsed as T, requestId: serverRequestId };
+}
+
+async function fetchJson<T>(url: string, init: FetchJsonInit = {}): Promise<T> {
+  const { data } = await apiFetch<T>(url, init);
+  return data;
 }
 
 export async function fetchStores(params: { location: string; radius_m?: number }): Promise<StoreSearchResponse> {
@@ -4730,22 +5745,23 @@ export async function submitPrice(req: PriceSubmitRequest): Promise<PriceSubmitR
 }
 </file>
 
-<file path="packages/shared/src/index.ts">
-export * from "./cart.js";
-export * from "./pricing.js";
-export * from "./product.js";
-export * from "./store.js";
-</file>
-
 <file path="apps/web/src/App.tsx">
 import type { CartLine, CartQuoteResponse, Product, ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
 import "leaflet/dist/leaflet.css";
 import { useMemo, useState } from "react";
 import { MapContainer, Marker, Popup, TileLayer } from "react-leaflet";
-import { fetchStores, lookupProductByUpc, quoteCart, searchProducts, submitPrice } from "./lib/api";
+import { ApiError, fetchStores, lookupProductByUpc, quoteCart, searchProducts, submitPrice } from "./lib/api";
 import { useCart } from "./lib/cart";
+import { AttributionFooter } from "./components/AttributionFooter";
 
 function formatErrorMessage(err: unknown) {
+  if (err instanceof ApiError) {
+    const friendly =
+      err.code === "RATE_LIMITED" || err.code === "HTTP_429"
+        ? "Provider is busy; please retry shortly."
+        : err.message;
+    return `${friendly} (Request ID: ${err.requestId ?? "unknown"})`;
+  }
   return err instanceof Error ? err.message : String(err);
 }
 
@@ -4773,6 +5789,37 @@ function sourceLabel(source: string | null | undefined) {
   if (source === "seed") return "Seed";
   return "";
 }
+
+const ATTRIBUTION_META = {
+  osm: {
+    text: "© OpenStreetMap contributors",
+    href: "https://www.openstreetmap.org/copyright"
+  },
+  nominatim: {
+    text: "Geocoding by Nominatim (OpenStreetMap)",
+    href: "https://operations.osmfoundation.org/policies/nominatim/"
+  },
+  overpass: {
+    text: "POI search via Overpass API (OpenStreetMap)",
+    href: "https://dev.overpass-api.de/overpass-doc/en/preface/commons.html"
+  },
+  openfoodfacts: {
+    text: "Data © Open Food Facts contributors",
+    href: "https://world.openfoodfacts.org/terms-of-use"
+  },
+  openprices: {
+    text: "Price data © Open Prices contributors",
+    href: "https://prices.openfoodfacts.org"
+  },
+  kroger: {
+    text: "Live prices via Kroger API (where available)",
+    href: "https://developer.kroger.com/"
+  }
+} as const;
+
+const ATTRIBUTION_ORDER = ["osm", "nominatim", "overpass", "openfoodfacts", "openprices", "kroger"] as const;
+
+type AttributionId = (typeof ATTRIBUTION_ORDER)[number];
 
 export default function App() {
   const [view, setView] = useState<"stores" | "products" | "cart">("stores");
@@ -4808,6 +5855,34 @@ export default function App() {
     const first = stores?.stores?.[0];
     return first ? { lat: first.lat, lon: first.lon } : { lat: 40.7484, lon: -73.9967 }; // Midtown fallback
   }, [stores]);
+
+  const attributionItems = useMemo(() => {
+    const selection = new Set<AttributionId>();
+    if (stores) {
+      selection.add("osm");
+      selection.add("nominatim");
+      selection.add("overpass");
+    }
+    if (lookup?.product || (search?.products.length ?? 0) > 0) {
+      selection.add("openfoodfacts");
+    }
+    const sources = new Set<string>();
+    for (const store of quote?.stores ?? []) {
+      for (const line of store.lines) {
+        if (line.source) sources.add(line.source);
+      }
+    }
+    if (sources.has("open_prices")) {
+      selection.add("openprices");
+    }
+    if (sources.has("kroger")) {
+      selection.add("kroger");
+    }
+
+    return ATTRIBUTION_ORDER
+      .filter((id) => selection.has(id))
+      .map((id) => ({ id, ...ATTRIBUTION_META[id] }));
+  }, [stores, lookup, quote, search]);
 
   async function onSearchStores() {
     setSStatus("Loading...");
@@ -4894,13 +5969,13 @@ export default function App() {
       <header style={{ display: "flex", gap: 8, alignItems: "center", justifyContent: "space-between" }}>
         <h2 style={{ margin: 0 }}>PriceCart</h2>
         <nav style={{ display: "flex", gap: 8 }}>
-          <button onClick={() => setView("stores")} disabled={view === "stores"}>
+          <button type="button" onClick={() => setView("stores")} disabled={view === "stores"}>
             Stores
           </button>
-          <button onClick={() => setView("products")} disabled={view === "products"}>
+          <button type="button" onClick={() => setView("products")} disabled={view === "products"}>
             Products
           </button>
-          <button onClick={() => setView("cart")} disabled={view === "cart"}>
+          <button type="button" onClick={() => setView("cart")} disabled={view === "cart"}>
             Cart {cart.cart ? `(${cart.cart.item_count})` : ""}
           </button>
         </nav>
@@ -4925,10 +6000,16 @@ export default function App() {
                 style={{ marginLeft: 8, width: 120 }}
               />
             </label>
-            <button onClick={onSearchStores}>Search</button>
+            <button type="button" onClick={onSearchStores}>
+              Search
+            </button>
           </div>
 
-          {sStatus && <p>{sStatus}</p>}
+          {sStatus && (
+            <p role="status" aria-live="polite">
+              {sStatus}
+            </p>
+          )}
 
           {stores && (
             <>
@@ -4981,9 +6062,13 @@ export default function App() {
                 UPC
                 <input value={upc} onChange={(e) => setUpc(e.target.value)} style={{ marginLeft: 8 }} />
               </label>
-              <button onClick={onLookupUpc}>Lookup</button>
+              <button type="button" onClick={onLookupUpc}>
+                Lookup
+              </button>
               {lookup?.product && (
-                <button onClick={() => addProductToCart(lookup.product)}>Add to cart</button>
+                <button type="button" onClick={() => addProductToCart(lookup.product)}>
+                  Add to cart
+                </button>
               )}
             </div>
 
@@ -5000,10 +6085,16 @@ export default function App() {
                 Search
                 <input value={q} onChange={(e) => setQ(e.target.value)} style={{ marginLeft: 8, width: 260 }} />
               </label>
-              <button onClick={onSearchProducts}>Search</button>
+              <button type="button" onClick={onSearchProducts}>
+                Search
+              </button>
             </div>
 
-            {pStatus && <p>{pStatus}</p>}
+            {pStatus && (
+              <p role="status" aria-live="polite">
+                {pStatus}
+              </p>
+            )}
 
             {search && (
               <>
@@ -5016,7 +6107,9 @@ export default function App() {
                       <span style={{ flex: 1 }}>
                         <b>{p.name}</b> {p.brand ? <span style={{ opacity: 0.8 }}>({p.brand})</span> : null}
                       </span>
-                      <button onClick={() => cart.add(p.upc, 1)}>Add</button>
+                      <button type="button" onClick={() => cart.add(p.upc, 1)}>
+                        Add
+                      </button>
                     </li>
                   ))}
                 </ul>
@@ -5030,8 +6123,16 @@ export default function App() {
         <section>
           <h3>Your cart</h3>
 
-          {cart.status === "loading" && <p>Loading...</p>}
-          {cart.status === "error" && <p>Error: {cart.error}</p>}
+          {cart.status === "loading" && (
+            <p role="status" aria-live="polite">
+              Loading...
+            </p>
+          )}
+          {cart.status === "error" && (
+            <p role="status" aria-live="polite">
+              Error: {cart.error}
+            </p>
+          )}
 
           {cart.cart && cart.cart.item_count === 0 && <p>Your cart is empty. Add items from the Products tab.</p>}
 
@@ -5053,7 +6154,11 @@ export default function App() {
                     </div>
 
                     <div style={{ display: "flex", gap: 8, alignItems: "center", justifyContent: "flex-end" }}>
-                      <button onClick={() => cart.setQuantity(it.upc, Math.max(1, it.count - 1))} aria-label="Decrease">
+                      <button
+                        type="button"
+                        onClick={() => cart.setQuantity(it.upc, Math.max(1, it.count - 1))}
+                        aria-label="Decrease"
+                      >
                         -
                       </button>
                       <input
@@ -5064,21 +6169,35 @@ export default function App() {
                         onChange={(e) => cart.setQuantity(it.upc, Math.max(1, Math.min(99, Number(e.target.value) || 1)))}
                         style={{ width: 64 }}
                       />
-                      <button onClick={() => cart.setQuantity(it.upc, Math.min(99, it.count + 1))} aria-label="Increase">
+                      <button
+                        type="button"
+                        onClick={() => cart.setQuantity(it.upc, Math.min(99, it.count + 1))}
+                        aria-label="Increase"
+                      >
                         +
                       </button>
-                      <button onClick={() => cart.remove(it.upc)}>Remove</button>
+                      <button type="button" onClick={() => cart.remove(it.upc)}>
+                        Remove
+                      </button>
                     </div>
                   </li>
                 ))}
               </ul>
 
               <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-                <button onClick={cart.clear}>Clear cart</button>
-                <button onClick={onComparePrices}>Compare prices</button>
+                <button type="button" onClick={cart.clear}>
+                  Clear cart
+                </button>
+                <button type="button" onClick={onComparePrices}>
+                  Compare prices
+                </button>
               </div>
 
-              {quoteStatus && <p>{quoteStatus}</p>}
+              {quoteStatus && (
+                <p role="status" aria-live="polite">
+                  {quoteStatus}
+                </p>
+              )}
 
               {quote && (
                 <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
@@ -5178,16 +6297,24 @@ export default function App() {
                       />
                     </label>
 
-                    <button onClick={onSubmitPrice}>Submit</button>
+                    <button type="button" onClick={onSubmitPrice}>
+                      Submit
+                    </button>
                   </div>
 
-                  {submitStatus && <p>{submitStatus}</p>}
+                  {submitStatus && (
+                    <p role="status" aria-live="polite">
+                      {submitStatus}
+                    </p>
+                  )}
                 </div>
               )}
             </>
           )}
         </section>
       )}
+
+      <AttributionFooter items={attributionItems} />
 
       <footer style={{ marginTop: 24, opacity: 0.75 }}>
         <small>
