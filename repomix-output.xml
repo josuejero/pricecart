@@ -1,0 +1,3279 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+apps/
+  api/
+    migrations/
+      0001_phase1_store_discovery.sql
+      0002_phase1_seed_stores.sql
+      0003_phase2_product_identity.sql
+      0004_phase2_seed_products.sql
+    src/
+      lib/
+        cache.ts
+        circuitBreaker.ts
+        geo.ts
+        hash.ts
+        rateLimit.test.ts
+        rateLimit.ts
+        time.ts
+      middleware/
+        cors.ts
+        security.ts
+      providers/
+        __fixtures__/
+          off_lookup_found.json
+          off_lookup_not_found.json
+          off_schema_drift.json
+          off_search_found.json
+        nominatim.ts
+        openFoodFacts.contract.test.ts
+        openFoodFacts.ts
+        overpass.ts
+      services/
+        productCatalog.ts
+        productSearch.ts
+        storeDiscovery.ts
+      types/
+        cloudflare-runtime.d.ts
+        pricecart-shared.d.ts
+      App.css
+      App.tsx
+      env.ts
+      index.css
+      index.ts
+      main.tsx
+      vite-env.d.ts
+    worker/
+      index.ts
+    .gitignore
+    eslint.config.js
+    index.html
+    package.json
+    README.md
+    tsconfig.app.json
+    tsconfig.client.json
+    tsconfig.json
+    tsconfig.node.json
+    tsconfig.tsbuildinfo
+    tsconfig.worker.json
+    vite.config.ts
+    wrangler.jsonc
+    wrangler.toml
+  web/
+    src/
+      lib/
+        api.ts
+        session.ts
+      App.css
+      App.tsx
+      index.css
+      main.tsx
+    .env
+    .env.example
+    .gitignore
+    eslint.config.js
+    index.html
+    package.json
+    README.md
+    tsconfig.app.json
+    tsconfig.json
+    tsconfig.node.json
+    vite.config.ts
+packages/
+  shared/
+    src/
+      index.ts
+      product.ts
+      store.ts
+    package.json
+    tsconfig.json
+.gitignore
+.repomixignore
+package.json
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="apps/api/migrations/0001_phase1_store_discovery.sql">
+CREATE TABLE IF NOT EXISTS query_cache (
+  cache_key TEXT PRIMARY KEY,
+  payload_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_query_cache_expires ON query_cache(expires_at);
+
+-- Per-session token buckets for provider guardrails
+CREATE TABLE IF NOT EXISTS rate_limits (
+  rl_key TEXT PRIMARY KEY,
+  tokens REAL NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+-- Provider circuit breaker state
+CREATE TABLE IF NOT EXISTS provider_health (
+  provider TEXT PRIMARY KEY,
+  consecutive_failures INTEGER NOT NULL,
+  open_until INTEGER NOT NULL
+);
+
+-- Stores table (seed + OSM)
+CREATE TABLE IF NOT EXISTS stores (
+  id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,              -- osm | seed
+  external_id TEXT,                  -- e.g., osm:node/123
+  name TEXT NOT NULL,
+  lat REAL NOT NULL,
+  lon REAL NOT NULL,
+  tags_json TEXT,
+  last_seen_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_stores_source_external
+  ON stores(source, external_id);
+
+-- Seed data marker
+CREATE TABLE IF NOT EXISTS seed_meta (
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL
+);
+</file>
+
+<file path="apps/api/migrations/0002_phase1_seed_stores.sql">
+INSERT OR REPLACE INTO seed_meta (k, v) VALUES ('seed_version', 'phase1-v1');
+
+-- Seed stores (example: Manhattan-ish). Replace/expand as desired.
+INSERT OR REPLACE INTO stores (id, source, external_id, name, lat, lon, tags_json, last_seen_at) VALUES
+('seed-1', 'seed', NULL, 'Seed Market A', 40.748400, -73.985700, '{"shop":"supermarket"}', strftime('%s','now')),
+('seed-2', 'seed', NULL, 'Seed Grocery B', 40.742000, -73.992000, '{"shop":"supermarket"}', strftime('%s','now')),
+('seed-3', 'seed', NULL, 'Seed Convenience C', 40.754000, -73.977500, '{"shop":"convenience"}', strftime('%s','now'));
+</file>
+
+<file path="apps/api/migrations/0003_phase2_product_identity.sql">
+-- Phase 2: product identity (Open Food Facts)
+
+CREATE TABLE IF NOT EXISTS products (
+  upc TEXT PRIMARY KEY,
+  source TEXT NOT NULL,              -- openfoodfacts | seed
+  off_product_id TEXT,
+  name TEXT NOT NULL,
+  brand TEXT,
+  quantity_value REAL,
+  quantity_unit TEXT,
+  normalized_name TEXT NOT NULL,
+  image_url TEXT,
+  source_url TEXT,
+  updated_at INTEGER NOT NULL,
+  raw_hash TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_products_normalized_name
+  ON products(normalized_name);
+
+-- Optional: store raw payload + hash for drift detection
+CREATE TABLE IF NOT EXISTS product_provider_payloads (
+  provider TEXT NOT NULL,
+  upc TEXT NOT NULL,
+  raw_json TEXT NOT NULL,
+  raw_hash TEXT NOT NULL,
+  fetched_at INTEGER NOT NULL,
+  PRIMARY KEY (provider, upc)
+);
+</file>
+
+<file path="apps/api/migrations/0004_phase2_seed_products.sql">
+INSERT OR REPLACE INTO seed_meta (k, v) VALUES ('seed_products_version', 'phase2-v1');
+
+INSERT OR REPLACE INTO products (
+  upc, source, off_product_id, name, brand, quantity_value, quantity_unit,
+  normalized_name, image_url, source_url, updated_at, raw_hash
+) VALUES
+(
+  '0000000000001', 'seed', NULL,
+  'Seed Whole Milk', 'Seed Brand',
+  1.0, 'l',
+  'seed brand seed whole milk',
+  NULL, NULL,
+  strftime('%s','now'),
+  NULL
+),
+(
+  '0000000000002', 'seed', NULL,
+  'Seed Peanut Butter', 'Seed Brand',
+  16.0, 'oz',
+  'seed brand seed peanut butter',
+  NULL, NULL,
+  strftime('%s','now'),
+  NULL
+);
+</file>
+
+<file path="apps/api/src/lib/cache.ts">
+import { nowSec } from "./time";
+
+export async function cacheGet<T>(db: D1Database, cacheKey: string): Promise<T | null> {
+  const t = nowSec();
+  const row = await db
+    .prepare("SELECT payload_json, expires_at FROM query_cache WHERE cache_key = ?")
+    .bind(cacheKey)
+    .first<{ payload_json: string; expires_at: number }>();
+
+  if (!row) return null;
+  if (row.expires_at <= t) return null;
+  return JSON.parse(row.payload_json) as T;
+}
+
+export async function cachePut<T>(
+  db: D1Database,
+  cacheKey: string,
+  payload: T,
+  ttlSec: number
+): Promise<void> {
+  const t = nowSec();
+  const expires = t + ttlSec;
+  await db
+    .prepare(
+      "INSERT OR REPLACE INTO query_cache (cache_key, payload_json, created_at, expires_at) VALUES (?, ?, ?, ?)"
+    )
+    .bind(cacheKey, JSON.stringify(payload), t, expires)
+    .run();
+}
+
+export async function cachePurgeExpired(db: D1Database): Promise<void> {
+  const t = nowSec();
+  await db.prepare("DELETE FROM query_cache WHERE expires_at <= ?").bind(t).run();
+}
+
+
+export async function cachePeek<T>(
+  db: D1Database,
+  cacheKey: string
+): Promise<{ payload: T; expires_at: number; is_fresh: boolean } | null> {
+  const t = nowSec();
+  const row = await db
+    .prepare("SELECT payload_json, expires_at FROM query_cache WHERE cache_key = ?")
+    .bind(cacheKey)
+    .first<{ payload_json: string; expires_at: number }>();
+
+  if (!row) return null;
+
+  const payload = JSON.parse(row.payload_json) as T;
+  return { payload, expires_at: row.expires_at, is_fresh: row.expires_at > t };
+}
+</file>
+
+<file path="apps/api/src/lib/circuitBreaker.ts">
+import { nowSec } from "./time";
+
+type Row = { consecutive_failures: number; open_until: number };
+
+export async function isOpen(db: D1Database, provider: string): Promise<boolean> {
+  const t = nowSec();
+  const row = await db
+    .prepare("SELECT consecutive_failures, open_until FROM provider_health WHERE provider = ?")
+    .bind(provider)
+    .first<Row>();
+  if (!row) return false;
+  return row.open_until > t;
+}
+
+export async function recordSuccess(db: D1Database, provider: string): Promise<void> {
+  await db
+    .prepare(
+      "INSERT OR REPLACE INTO provider_health (provider, consecutive_failures, open_until) VALUES (?, 0, 0)"
+    )
+    .bind(provider)
+    .run();
+}
+
+export async function recordFailure(
+  db: D1Database,
+  provider: string,
+  opts?: { tripAfter?: number; openForSec?: number }
+): Promise<void> {
+  const tripAfter = opts?.tripAfter ?? 3;
+  const openForSec = opts?.openForSec ?? 300;
+
+  const t = nowSec();
+  const row = await db
+    .prepare("SELECT consecutive_failures, open_until FROM provider_health WHERE provider = ?")
+    .bind(provider)
+    .first<Row>();
+
+  const failures = (row?.consecutive_failures ?? 0) + 1;
+  const openUntil = failures >= tripAfter ? t + openForSec : (row?.open_until ?? 0);
+
+  await db
+    .prepare(
+      "INSERT OR REPLACE INTO provider_health (provider, consecutive_failures, open_until) VALUES (?, ?, ?)"
+    )
+    .bind(provider, failures, openUntil)
+    .run();
+}
+</file>
+
+<file path="apps/api/src/lib/geo.ts">
+// Haversine distance (meters)
+export function distanceMeters(a: { lat: number; lon: number }, b: { lat: number; lon: number }): number {
+  const R = 6371000;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+
+  const dLat = toRad(b.lat - a.lat);
+  const dLon = toRad(b.lon - a.lon);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+
+  const sinDLat = Math.sin(dLat / 2);
+  const sinDLon = Math.sin(dLon / 2);
+
+  const h = sinDLat * sinDLat + Math.cos(lat1) * Math.cos(lat2) * sinDLon * sinDLon;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+</file>
+
+<file path="apps/api/src/lib/hash.ts">
+export async function sha256Base64Url(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  const bytes = new Uint8Array(digest);
+  const b64 = btoa(String.fromCharCode(...bytes));
+  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+</file>
+
+<file path="apps/api/src/lib/rateLimit.test.ts">
+import { describe, expect, it } from "vitest";
+import { takeToken } from "./rateLimit";
+
+function fakeDb(): D1Database {
+  const m = new Map<string, { tokens: number; updated_at: number }>();
+  return {
+    prepare(sql: string) {
+      return {
+        bind(key: string, ...rest: unknown[]) {
+          return {
+            async first() {
+              return m.get(key) ?? null;
+            },
+            async run() {
+              if (sql.includes("INSERT OR REPLACE INTO rate_limits")) {
+                const [tokensValue, updatedValue] = rest;
+                const tokens = Number(tokensValue);
+                const updated = Number(updatedValue);
+                m.set(key, { tokens, updated_at: updated });
+              }
+              return { success: true };
+            }
+          };
+        }
+      };
+    }
+  } as unknown as D1Database;
+}
+
+describe("takeToken", () => {
+  it("allows up to capacity then blocks", async () => {
+    const db = fakeDb();
+    const cfg = { capacity: 2, refillPerSec: 0, cost: 1 };
+
+    expect(await takeToken(db, "k", cfg)).toBe(true);
+    expect(await takeToken(db, "k", cfg)).toBe(true);
+    expect(await takeToken(db, "k", cfg)).toBe(false);
+  });
+});
+</file>
+
+<file path="apps/api/src/lib/rateLimit.ts">
+import { nowSec } from "./time";
+
+export type TokenBucketConfig = {
+  capacity: number;        // max tokens stored
+  refillPerSec: number;    // tokens added per second
+  cost: number;            // tokens consumed per operation
+};
+
+/**
+ * Leaky token bucket stored in D1.
+ * Returns true if allowed, false if rate-limited.
+ */
+export async function takeToken(
+  db: D1Database,
+  key: string,
+  cfg: TokenBucketConfig
+): Promise<boolean> {
+  const t = nowSec();
+  const row = await db
+    .prepare("SELECT tokens, updated_at FROM rate_limits WHERE rl_key = ?")
+    .bind(key)
+    .first<{ tokens: number; updated_at: number }>();
+
+  let tokens = row?.tokens ?? cfg.capacity;
+  const updatedAt = row?.updated_at ?? t;
+  const elapsed = Math.max(0, t - updatedAt);
+
+  tokens = Math.min(cfg.capacity, tokens + elapsed * cfg.refillPerSec);
+
+  const allowed = tokens >= cfg.cost;
+  if (allowed) tokens -= cfg.cost;
+
+  await db
+    .prepare("INSERT OR REPLACE INTO rate_limits (rl_key, tokens, updated_at) VALUES (?, ?, ?)")
+    .bind(key, tokens, t)
+    .run();
+
+  return allowed;
+}
+</file>
+
+<file path="apps/api/src/lib/time.ts">
+export const nowSec = () => Math.floor(Date.now() / 1000);
+</file>
+
+<file path="apps/api/src/middleware/cors.ts">
+import type { MiddlewareHandler } from "hono";
+
+export function cors(allowedOrigin: string): MiddlewareHandler {
+  return async (c, next) => {
+    const origin = c.req.header("Origin") || "";
+    if (origin && origin === allowedOrigin) {
+      c.header("Access-Control-Allow-Origin", origin);
+      c.header("Vary", "Origin");
+      c.header("Access-Control-Allow-Headers", "content-type, x-pricecart-session");
+      c.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+    }
+
+    if (c.req.method === "OPTIONS") {
+      return c.body(null, 204);
+    }
+
+    await next();
+  };
+}
+</file>
+
+<file path="apps/api/src/middleware/security.ts">
+import type { MiddlewareHandler } from "hono";
+
+export function securityHeaders(): MiddlewareHandler {
+  return async (c, next) => {
+    await next();
+    c.header("X-Content-Type-Options", "nosniff");
+    c.header("X-Frame-Options", "DENY");
+    c.header("Referrer-Policy", "no-referrer");
+    c.header("Permissions-Policy", "geolocation=()",);
+  };
+}
+</file>
+
+<file path="apps/api/src/providers/__fixtures__/off_lookup_found.json">
+{
+  "status": 1,
+  "product": {
+    "code": "0123456789012",
+    "product_name": "Fixture Granola Bar",
+    "brands": "Fixture Brand",
+    "quantity": "40 g",
+    "image_front_url": "https://example.com/img.jpg",
+    "url": "https://world.openfoodfacts.org/product/0123456789012",
+    "last_modified_t": 1700000000
+  }
+}
+</file>
+
+<file path="apps/api/src/providers/__fixtures__/off_lookup_not_found.json">
+{ "status": 0, "status_verbose": "product not found" }
+</file>
+
+<file path="apps/api/src/providers/__fixtures__/off_schema_drift.json">
+{
+  "status": 1,
+  "product": {
+    "code": "0123456789012",
+    "product_name": "Fixture Granola Bar",
+    "brands": "Fixture Brand",
+    "quantity": "40 g",
+    "some_new_field": { "nested": true }
+  }
+}
+</file>
+
+<file path="apps/api/src/providers/__fixtures__/off_search_found.json">
+{
+  "count": 2,
+  "page": 1,
+  "page_size": 10,
+  "products": [
+    {
+      "code": "0123456789012",
+      "product_name": "Fixture Granola Bar",
+      "brands": "Fixture Brand",
+      "quantity": "40 g",
+      "url": "https://world.openfoodfacts.org/product/0123456789012"
+    },
+    {
+      "code": "0000000000001",
+      "product_name": "Fixture Milk",
+      "brands": "Fixture Brand",
+      "quantity": "1 L",
+      "url": "https://world.openfoodfacts.org/product/0000000000001"
+    }
+  ]
+}
+</file>
+
+<file path="apps/api/src/providers/nominatim.ts">
+import { isOpen, recordFailure, recordSuccess } from "../lib/circuitBreaker";
+
+export type GeocodeResult = { lat: number; lon: number; display_name?: string };
+
+export async function geocode(
+  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string },
+  location: string
+): Promise<GeocodeResult> {
+  const provider = "nominatim";
+  if (await isOpen(env.DB, provider)) throw new Error("PROVIDER_OPEN");
+
+  const url = new URL("https://nominatim.openstreetmap.org/search");
+  url.searchParams.set("q", location);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("limit", "1");
+
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    "User-Agent": env.OUTBOUND_USER_AGENT || "PriceCart/0.1 (contact: you@example.com)",
+    Referer: env.OUTBOUND_REFERER || "https://example.com"
+  };
+
+  try {
+    const res = await fetch(url.toString(), { headers });
+    if (!res.ok) {
+      await recordFailure(env.DB, provider);
+      throw new Error(`Nominatim HTTP ${res.status}`);
+    }
+
+    const json = (await res.json()) as Array<{ lat: string; lon: string; display_name?: string }>;
+    if (!json[0]) {
+      await recordSuccess(env.DB, provider);
+      throw new Error("NOT_FOUND");
+    }
+
+    await recordSuccess(env.DB, provider);
+    return { lat: Number(json[0].lat), lon: Number(json[0].lon), display_name: json[0].display_name };
+  } catch (e) {
+    await recordFailure(env.DB, provider);
+    throw e;
+  }
+}
+</file>
+
+<file path="apps/api/src/providers/openFoodFacts.contract.test.ts">
+import { describe, expect, it } from "vitest";
+import { parseOffLookupResponse, parseOffSearchResponse } from "./openFoodFacts";
+
+import { readFileSync } from "node:fs";
+
+function loadFixture(path: string) {
+  const p = new URL(path, import.meta.url);
+  return JSON.parse(readFileSync(p, "utf-8"));
+}
+
+describe("OpenFoodFacts provider parsing", () => {
+  it("parses lookup happy path", async () => {
+    const json = await loadFixture("./__fixtures__/off_lookup_found.json");
+    const p = parseOffLookupResponse(json, "0123456789012");
+    expect(p.code).toBe("0123456789012");
+    expect(p.product_name).toMatch(/Fixture/);
+  });
+
+  it("lookup not found maps to NOT_FOUND", async () => {
+    const json = await loadFixture("./__fixtures__/off_lookup_not_found.json");
+    expect(() => parseOffLookupResponse(json, "0123456789012")).toThrow(/NOT_FOUND/);
+  });
+
+  it("parses search response", async () => {
+    const json = await loadFixture("./__fixtures__/off_search_found.json");
+    const r = parseOffSearchResponse(json);
+    expect(r.products.length).toBeGreaterThan(0);
+  });
+
+  it("tolerates schema drift", async () => {
+    const json = await loadFixture("./__fixtures__/off_schema_drift.json");
+    const p = parseOffLookupResponse(json, "0123456789012");
+    expect(p.code).toBe("0123456789012");
+  });
+});
+</file>
+
+<file path="apps/api/src/providers/openFoodFacts.ts">
+import { z } from "zod";
+import { isOpen, recordFailure, recordSuccess } from "../lib/circuitBreaker";
+
+export const OFF_ATTRIBUTION = {
+  text: "Data from Open Food Facts",
+  links: [
+    { label: "Open Food Facts", href: "https://world.openfoodfacts.org" },
+    { label: "API", href: "https://openfoodfacts.github.io/openfoodfacts-server/api/" }
+  ]
+};
+
+export type OffProductRaw = {
+  code: string;
+  product_name: string | null;
+  brands: string | null;
+  quantity: string | null;
+  image_front_url: string | null;
+  url: string | null;
+  last_modified_t: number | null;
+};
+
+const OffProductSchema = z
+  .object({
+    code: z.string().optional(),
+    product_name: z.string().optional(),
+    brands: z.string().optional(),
+    quantity: z.string().optional(),
+    image_front_url: z.string().url().optional(),
+    url: z.string().url().optional(),
+    last_modified_t: z.number().optional()
+  })
+  .passthrough();
+
+const OffLookupSchema = z
+  .object({
+    status: z.number(),
+    status_verbose: z.string().optional(),
+    product: OffProductSchema.optional()
+  })
+  .passthrough();
+
+const OffSearchSchema = z
+  .object({
+    count: z.number().optional(),
+    page: z.number().optional(),
+    page_size: z.number().optional(),
+    products: z.array(OffProductSchema).default([])
+  })
+  .passthrough();
+
+export function parseOffLookupResponse(json: unknown, upc: string): OffProductRaw {
+  const parsed = OffLookupSchema.safeParse(json);
+  if (!parsed.success) throw new Error("OFF_SCHEMA");
+
+  if (parsed.data.status !== 1 || !parsed.data.product) throw new Error("NOT_FOUND");
+
+  const p = parsed.data.product;
+  return {
+    code: String(p.code ?? upc),
+    product_name: p.product_name ?? null,
+    brands: p.brands ?? null,
+    quantity: p.quantity ?? null,
+    image_front_url: p.image_front_url ?? null,
+    url: p.url ?? null,
+    last_modified_t: p.last_modified_t ?? null
+  };
+}
+
+export function parseOffSearchResponse(json: unknown): {
+  total: number;
+  page: number;
+  page_size: number;
+  products: OffProductRaw[];
+} {
+  const parsed = OffSearchSchema.safeParse(json);
+  if (!parsed.success) throw new Error("OFF_SCHEMA");
+
+  const total = parsed.data.count ?? parsed.data.products.length;
+  const page = parsed.data.page ?? 1;
+  const page_size = parsed.data.page_size ?? parsed.data.products.length;
+
+  const products: OffProductRaw[] = parsed.data.products.map((p) => ({
+    code: String(p.code ?? ""),
+    product_name: p.product_name ?? null,
+    brands: p.brands ?? null,
+    quantity: p.quantity ?? null,
+    image_front_url: p.image_front_url ?? null,
+    url: p.url ?? null,
+    last_modified_t: p.last_modified_t ?? null
+  }));
+
+  return { total, page, page_size, products };
+}
+
+function buildHeaders(env: { OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string }): Record<string, string> {
+  return {
+    Accept: "application/json",
+    "User-Agent": env.OUTBOUND_USER_AGENT || "PriceCart/0.1 (contact: you@example.com)",
+    Referer: env.OUTBOUND_REFERER || "https://example.com"
+  };
+}
+
+async function fetchJson(url: string, headers: Record<string, string>, timeoutMs: number) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { headers, signal: ctrl.signal });
+    return { res, json: await res.json().catch(() => null) };
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+export async function offLookupByUpc(
+  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string; OFF_BASE_URL?: string },
+  upc: string
+): Promise<OffProductRaw> {
+  const provider = "openfoodfacts";
+  if (await isOpen(env.DB, provider)) throw new Error("PROVIDER_OPEN");
+
+  const base = env.OFF_BASE_URL || "https://world.openfoodfacts.org";
+  const url = new URL(`${base}/api/v2/product/${encodeURIComponent(upc)}.json`);
+  url.searchParams.set("fields", "code,product_name,brands,quantity,image_front_url,url,last_modified_t");
+
+  try {
+    const { res, json } = await fetchJson(url.toString(), buildHeaders(env), 8000);
+    if (!res.ok) {
+      await recordFailure(env.DB, provider);
+      throw new Error(`OFF_HTTP_${res.status}`);
+    }
+
+    const product = parseOffLookupResponse(json, upc);
+    await recordSuccess(env.DB, provider);
+    return product;
+  } catch (e) {
+    await recordFailure(env.DB, provider);
+    throw e;
+  }
+}
+
+export async function offSearch(
+  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string; OFF_BASE_URL?: string },
+  q: string,
+  page: number,
+  pageSize: number
+): Promise<{ total: number; page: number; page_size: number; products: OffProductRaw[] }> {
+  const provider = "openfoodfacts";
+  if (await isOpen(env.DB, provider)) throw new Error("PROVIDER_OPEN");
+
+  const base = env.OFF_BASE_URL || "https://world.openfoodfacts.org";
+  const url = new URL(`${base}/api/v2/search`);
+  url.searchParams.set("search_terms", q);
+  url.searchParams.set("page", String(page));
+  url.searchParams.set("page_size", String(pageSize));
+  url.searchParams.set("fields", "code,product_name,brands,quantity,image_front_url,url,last_modified_t");
+
+  try {
+    const { res, json } = await fetchJson(url.toString(), buildHeaders(env), 9000);
+    if (!res.ok) {
+      await recordFailure(env.DB, provider);
+      throw new Error(`OFF_HTTP_${res.status}`);
+    }
+
+    const parsed = parseOffSearchResponse(json);
+    await recordSuccess(env.DB, provider);
+    return { total: parsed.total, page: parsed.page, page_size: parsed.page_size, products: parsed.products };
+  } catch (e) {
+    await recordFailure(env.DB, provider);
+    throw e;
+  }
+}
+</file>
+
+<file path="apps/api/src/providers/overpass.ts">
+import { isOpen, recordFailure, recordSuccess } from "../lib/circuitBreaker";
+
+export type OverpassStore = {
+  external_id: string; // osm:node/123
+  name: string;
+  lat: number;
+  lon: number;
+  tags: Record<string, string>;
+};
+
+export async function queryNearbyStores(
+  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string },
+  center: { lat: number; lon: number },
+  radiusM: number
+): Promise<OverpassStore[]> {
+  const provider = "overpass";
+  if (await isOpen(env.DB, provider)) throw new Error("PROVIDER_OPEN");
+
+  const query = `
+[out:json][timeout:25];
+(
+  node[shop=supermarket](around:${radiusM},${center.lat},${center.lon});
+  node[shop=convenience](around:${radiusM},${center.lat},${center.lon});
+  node[shop=greengrocer](around:${radiusM},${center.lat},${center.lon});
+);
+out body;
+`;
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    Accept: "application/json",
+    "User-Agent": env.OUTBOUND_USER_AGENT || "PriceCart/0.1 (contact: you@example.com)",
+    Referer: env.OUTBOUND_REFERER || "https://example.com"
+  };
+
+  try {
+    const res = await fetch("https://overpass-api.de/api/interpreter", {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ data: query }).toString()
+    });
+
+    if (!res.ok) {
+      await recordFailure(env.DB, provider);
+      throw new Error(`Overpass HTTP ${res.status}`);
+    }
+
+    const json = (await res.json()) as {
+      elements: Array<{ type: string; id: number; lat: number; lon: number; tags?: Record<string, string> }>;
+    };
+
+    const stores: OverpassStore[] = (json.elements || [])
+      .filter((e) => e.type === "node")
+      .map((e) => {
+        const tags = e.tags || {};
+        const name = tags.name || tags.brand || "Unnamed store";
+        return {
+          external_id: `osm:${e.type}/${e.id}`,
+          name,
+          lat: e.lat,
+          lon: e.lon,
+          tags
+        };
+      });
+
+    await recordSuccess(env.DB, provider);
+    return stores;
+  } catch (e) {
+    await recordFailure(env.DB, provider);
+    throw e;
+  }
+}
+</file>
+
+<file path="apps/api/src/services/productCatalog.ts">
+import type { Product, ProductLookupResponse, ProductSearchResponse } from "@pricecart/shared";
+import { normalizeProductName, parseQuantity } from "@pricecart/shared";
+import { cachePeek, cachePut } from "../lib/cache";
+import { sha256Base64Url } from "../lib/hash";
+import { takeToken } from "../lib/rateLimit";
+import { nowSec } from "../lib/time";
+import { OFF_ATTRIBUTION, offLookupByUpc, offSearch, type OffProductRaw } from "../providers/openFoodFacts";
+
+const TTL_UPC_SEC = 60 * 60 * 24 * 7; // 7 days
+const TTL_SEARCH_SEC = 60 * 60 * 6;   // 6 hours
+
+// Conservative budgets (per session) - tune later
+const RL_OFF_LOOKUP = { capacity: 10, refillPerSec: 1 / 6, cost: 1 }; // ~10/min
+const RL_OFF_SEARCH = { capacity: 5, refillPerSec: 1 / 12, cost: 1 }; // ~5/min
+
+function pickBrand(brands: string | null): string | null {
+  if (!brands) return null;
+  const first = brands.split(",")[0]?.trim();
+  return first || null;
+}
+
+function toCanonicalProduct(raw: OffProductRaw): Product {
+  const brand = pickBrand(raw.brands);
+  const name = raw.product_name?.trim() || "Unknown product";
+
+  return {
+    upc: raw.code,
+    name,
+    brand,
+    normalized_name: normalizeProductName({ name, brand }),
+    quantity: parseQuantity(raw.quantity),
+    image_url: raw.image_front_url,
+    source: "openfoodfacts",
+    source_url: raw.url,
+    updated_at: nowSec()
+  };
+}
+
+async function upsertProduct(db: D1Database, p: Product, rawHash: string | null) {
+  await db
+    .prepare(
+      `INSERT OR REPLACE INTO products (
+        upc, source, off_product_id, name, brand,
+        quantity_value, quantity_unit,
+        normalized_name, image_url, source_url,
+        updated_at, raw_hash
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      p.upc,
+      p.source,
+      p.source === "openfoodfacts" ? `off:${p.upc}` : null,
+      p.name,
+      p.brand,
+      p.quantity.value,
+      p.quantity.unit,
+      p.normalized_name,
+      p.image_url,
+      p.source_url,
+      p.updated_at,
+      rawHash
+    )
+    .run();
+}
+
+async function recordRawPayload(db: D1Database, provider: string, upc: string, rawJson: unknown, rawHash: string) {
+  await db
+    .prepare(
+      "INSERT OR REPLACE INTO product_provider_payloads (provider, upc, raw_json, raw_hash, fetched_at) VALUES (?, ?, ?, ?, ?)"
+    )
+    .bind(provider, upc, JSON.stringify(rawJson), rawHash, nowSec())
+    .run();
+}
+
+async function readProductFromDb(db: D1Database, upc: string): Promise<Product | null> {
+  const row = await db
+    .prepare(
+      "SELECT upc, source, name, brand, quantity_value, quantity_unit, normalized_name, image_url, source_url, updated_at FROM products WHERE upc = ? LIMIT 1"
+    )
+    .bind(upc)
+    .first<{
+      upc: string;
+      source: "openfoodfacts" | "seed";
+      name: string;
+      brand: string | null;
+      quantity_value: number | null;
+      quantity_unit: string | null;
+      normalized_name: string;
+      image_url: string | null;
+      source_url: string | null;
+      updated_at: number;
+    }>();
+
+  if (!row) return null;
+  return {
+    upc: row.upc,
+    name: row.name,
+    brand: row.brand,
+    normalized_name: row.normalized_name,
+    quantity: { raw: null, value: row.quantity_value, unit: row.quantity_unit },
+    image_url: row.image_url,
+    source: row.source,
+    source_url: row.source_url,
+    updated_at: row.updated_at
+  };
+}
+
+function validateUpc(upc: string): string {
+  const u = upc.trim();
+  if (!/^\d{8,14}$/.test(u)) throw new Error("INVALID_UPC");
+  return u;
+}
+
+export async function lookupProduct(
+  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string; OFF_BASE_URL?: string },
+  input: { upc: string; session_id: string },
+  execCtx?: ExecutionContext
+): Promise<ProductLookupResponse> {
+  const upc = validateUpc(input.upc);
+  const cacheKey = `off:product:${upc}`;
+
+  const peek = await cachePeek<ProductLookupResponse>(env.DB, cacheKey);
+  if (peek?.is_fresh) {
+    return { ...peek.payload, data_mode: "cache", cache_state: "fresh" };
+  }
+  if (peek && !peek.is_fresh) {
+    // stale-while-revalidate
+    execCtx?.waitUntil(refreshLookup(env, upc, input.session_id).catch(() => {}));
+    return { ...peek.payload, data_mode: "cache", cache_state: "stale" };
+  }
+
+  // No cache at all, try live (with fallback)
+  try {
+    return await refreshLookup(env, upc, input.session_id);
+  } catch (e) {
+    const fallback = await readProductFromDb(env.DB, upc);
+    if (fallback) {
+      return {
+        data_mode: fallback.source === "seed" ? "seed" : "cache",
+        product: fallback,
+        attribution: OFF_ATTRIBUTION
+      };
+    }
+    throw e;
+  }
+}
+
+async function refreshLookup(
+  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string; OFF_BASE_URL?: string },
+  upc: string,
+  sessionId: string
+): Promise<ProductLookupResponse> {
+  const ok = await takeToken(env.DB, `rl:${sessionId}:openfoodfacts:lookup`, RL_OFF_LOOKUP);
+  if (!ok) throw new Error("RATE_LIMIT_OFF_LOOKUP");
+
+  const provider = "openfoodfacts";
+  const raw = await offLookupByUpc(env, upc);
+
+  // Hash raw-ish fields for drift detection (keep stable across irrelevant changes)
+  const hashInput = JSON.stringify({
+    code: raw.code,
+    product_name: raw.product_name,
+    brands: raw.brands,
+    quantity: raw.quantity,
+    image_front_url: raw.image_front_url,
+    url: raw.url,
+    last_modified_t: raw.last_modified_t
+  });
+  const rawHash = await sha256Base64Url(hashInput);
+
+  const p = toCanonicalProduct(raw);
+  await upsertProduct(env.DB, p, rawHash);
+  await recordRawPayload(env.DB, provider, upc, raw, rawHash);
+
+  const resp: ProductLookupResponse = {
+    data_mode: "live",
+    cache_state: "fresh",
+    product: p,
+    attribution: OFF_ATTRIBUTION
+  };
+
+  await cachePut(env.DB, `off:product:${upc}`, resp, TTL_UPC_SEC);
+  return resp;
+}
+
+export async function searchProducts(
+  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string; OFF_BASE_URL?: string },
+  input: { q: string; page: number; page_size: number; session_id: string },
+  execCtx?: ExecutionContext
+): Promise<ProductSearchResponse> {
+  const q = input.q.trim();
+  if (q.length < 2) throw new Error("INVALID_QUERY");
+
+  const page = Math.max(1, Math.min(input.page, 25));
+  const pageSize = Math.max(1, Math.min(input.page_size, 25));
+
+  const qKey = await sha256Base64Url(q.toLowerCase());
+  const cacheKey = `off:search:${qKey}:p=${page}:s=${pageSize}`;
+
+  const peek = await cachePeek<ProductSearchResponse>(env.DB, cacheKey);
+  if (peek?.is_fresh) return { ...peek.payload, data_mode: "cache", cache_state: "fresh" };
+  if (peek && !peek.is_fresh) {
+    execCtx?.waitUntil(refreshSearch(env, q, page, pageSize, input.session_id, cacheKey).catch(() => {}));
+    return { ...peek.payload, data_mode: "cache", cache_state: "stale" };
+  }
+
+  return await refreshSearch(env, q, page, pageSize, input.session_id, cacheKey);
+}
+
+async function refreshSearch(
+  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string; OFF_BASE_URL?: string },
+  q: string,
+  page: number,
+  pageSize: number,
+  sessionId: string,
+  cacheKey: string
+): Promise<ProductSearchResponse> {
+  const ok = await takeToken(env.DB, `rl:${sessionId}:openfoodfacts:search`, RL_OFF_SEARCH);
+  if (!ok) throw new Error("RATE_LIMIT_OFF_SEARCH");
+
+  const result = await offSearch(env, q, page, pageSize);
+
+  const products = result.products
+    .filter((p) => /^\d{8,14}$/.test(p.code))
+    .map((p) => toCanonicalProduct(p));
+
+  // Opportunistic upsert of search results
+  for (const p of products) {
+    await upsertProduct(env.DB, p, null);
+  }
+
+  const resp: ProductSearchResponse = {
+    data_mode: "live",
+    cache_state: "fresh",
+    query: q,
+    page,
+    page_size: pageSize,
+    total: result.total,
+    products,
+    attribution: OFF_ATTRIBUTION
+  };
+
+  await cachePut(env.DB, cacheKey, resp, TTL_SEARCH_SEC);
+  return resp;
+}
+</file>
+
+<file path="apps/api/src/services/productSearch.ts">
+import { cacheGet, cachePut } from "../lib/cache";
+import { sha256Base64Url } from "../lib/hash";
+import { takeToken } from "../lib/rateLimit";
+
+const TTL_OFF_SEARCH_SEC = 60 * 60; // 1 hour cache
+const RL_OFF_SEARCH = { capacity: 10, refillPerSec: 1 / 6, cost: 1 }; // ~10/min per session
+
+type OffSearchResponse = {
+  products?: unknown[];
+  count?: number | string;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function toStringValue(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (typeof value === "number") return String(value);
+  return undefined;
+}
+
+function toNumberValue(value: unknown): number | undefined {
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+type EnvLike = {
+  DB: D1Database;
+  OUTBOUND_USER_AGENT?: string;
+  OUTBOUND_REFERER?: string;
+  OFF_BASE_URL?: string; // optional
+};
+
+export type ProductSummary = {
+  code: string;
+  product_name?: string;
+  brands?: string;
+  quantity?: string;
+  image_url?: string;
+  nutriscore_grade?: string;
+};
+
+export type ProductSearchResponse = {
+  q: string;
+  page: number;
+  page_size: number;
+  total_count: number;
+  products: ProductSummary[];
+  attribution: {
+    text: string;
+    links: { label: string; href: string }[];
+  };
+};
+
+export async function productSearch(
+  env: EnvLike,
+  input: { q: string; page: number; page_size: number; session_id: string }
+): Promise<ProductSearchResponse> {
+  const q = input.q.trim();
+  const page = Math.max(1, input.page);
+  const pageSize = Math.min(Math.max(1, input.page_size), 50);
+
+  const cacheKey = `off:search:${await sha256Base64Url(
+    `${q.toLowerCase()}|p=${page}|s=${pageSize}`
+  )}`;
+
+  const cached = await cacheGet<ProductSearchResponse>(env.DB, cacheKey);
+  if (cached) return cached;
+
+  const ok = await takeToken(env.DB, `rl:${input.session_id}:off_search`, RL_OFF_SEARCH);
+  if (!ok) throw new Error("RATE_LIMIT_OFF_SEARCH");
+
+  const base = (env.OFF_BASE_URL || "https://world.openfoodfacts.org").replace(/\/+$/, "");
+  const url = new URL(`${base}/cgi/search.pl`);
+  url.searchParams.set("action", "process");
+  url.searchParams.set("search_terms", q);
+  url.searchParams.set("search_simple", "1");
+  url.searchParams.set("json", "1");
+  url.searchParams.set("page", String(page));
+  url.searchParams.set("page_size", String(pageSize));
+
+  const headers = new Headers();
+  // OFF asks for a custom User-Agent to identify your app. :contentReference[oaicite:2]{index=2}
+  headers.set("User-Agent", env.OUTBOUND_USER_AGENT || "PriceCart/0.1 (dev)");
+  if (env.OUTBOUND_REFERER) headers.set("Referer", env.OUTBOUND_REFERER);
+
+  const resp = await fetch(url.toString(), { headers });
+  if (resp.status === 429) throw new Error("RATE_LIMIT_OFF_REMOTE");
+  if (!resp.ok) throw new Error(`OFF_HTTP_${resp.status}`);
+
+  const rawData = await resp.json();
+  const data = isRecord(rawData) ? (rawData as OffSearchResponse) : {};
+  const productsRaw: unknown[] = Array.isArray(data.products) ? data.products : [];
+
+  const products: ProductSummary[] = productsRaw
+    .map((p) => {
+      if (!isRecord(p)) return null;
+      const code = toStringValue(p["code"])?.trim();
+      if (!code) return null;
+
+      return {
+        code,
+        product_name: toStringValue(p["product_name"]) ?? toStringValue(p["product_name_en"]),
+        brands: toStringValue(p["brands"]),
+        quantity: toStringValue(p["quantity"]),
+        image_url: toStringValue(p["image_url"]),
+        nutriscore_grade: toStringValue(p["nutriscore_grade"])
+      } satisfies ProductSummary;
+    })
+    .filter(Boolean) as ProductSummary[];
+
+  const out: ProductSearchResponse = {
+    q,
+    page,
+    page_size: pageSize,
+    total_count: toNumberValue(data.count) ?? products.length,
+    products,
+    attribution: {
+      text: "Data from Open Food Facts",
+      links: [{ label: "Open Food Facts", href: "https://world.openfoodfacts.org/" }]
+    }
+  };
+
+  await cachePut(env.DB, cacheKey, out, TTL_OFF_SEARCH_SEC);
+  return out;
+}
+</file>
+
+<file path="apps/api/src/services/storeDiscovery.ts">
+import type { StoreSearchResponse } from "@pricecart/shared";
+import { cacheGet, cachePut } from "../lib/cache";
+import { distanceMeters } from "../lib/geo";
+import { sha256Base64Url } from "../lib/hash";
+import { takeToken } from "../lib/rateLimit";
+import { nowSec } from "../lib/time";
+import { geocode } from "../providers/nominatim";
+import { queryNearbyStores } from "../providers/overpass";
+
+const TTL_GEOCODE_SEC = 60 * 60 * 24 * 30; // 30 days
+const TTL_STORES_SEC = 60 * 60 * 24;      // 1 day
+
+// Budgets (demo-friendly, provider-friendly)
+const RL_GEOCODE = { capacity: 10, refillPerSec: 1 / 10, cost: 1 };   // ~10/min max per session
+const RL_OVERPASS = { capacity: 10, refillPerSec: 1 / 30, cost: 1 };  // ~10/5min max per session
+
+export async function storeSearch(
+  env: { DB: D1Database; OUTBOUND_USER_AGENT?: string; OUTBOUND_REFERER?: string },
+  input: { location: string; radius_m: number; session_id: string }
+): Promise<StoreSearchResponse> {
+  const radius = Math.min(Math.max(input.radius_m, 250), 20000); // clamp 250m..20km
+
+  // 1) Geocode with caching + rate limit
+  const locNorm = input.location.trim().toLowerCase();
+  const geoKey = `geo:${await sha256Base64Url(locNorm)}`;
+  let center = await cacheGet<{ lat: number; lon: number }>(env.DB, geoKey);
+
+  if (!center) {
+    const ok = await takeToken(env.DB, `rl:${input.session_id}:nominatim`, RL_GEOCODE);
+    if (!ok) throw new Error("RATE_LIMIT_GEOCODE");
+
+    try {
+      const g = await geocode(env, input.location);
+      center = { lat: g.lat, lon: g.lon };
+      await cachePut(env.DB, geoKey, center, TTL_GEOCODE_SEC);
+    } catch (geocodeErr) {
+      try {
+        const fallback = await seedResponse(env, radius);
+        console.log(
+          JSON.stringify({
+            level: "warn",
+            message: "geocode failed, falling back to seeded stores",
+            err: String(geocodeErr)
+          })
+        );
+        return fallback;
+      } catch {
+        throw geocodeErr;
+      }
+    }
+  }
+
+  // 2) Store query with caching + rate limit + fallback
+  const storesKey = `stores:${await sha256Base64Url(
+    `${center.lat.toFixed(3)},${center.lon.toFixed(3)}:r=${radius}`
+  )}`;
+
+  const cached = await cacheGet<{ stores: StoreSearchResponse["stores"] }>(env.DB, storesKey);
+  if (cached?.stores?.length) {
+    return {
+      center,
+      radius_m: radius,
+      data_mode: "cache",
+      stores: cached.stores,
+      attribution: osmAttribution()
+    };
+  }
+
+  // Try live Overpass, else seed fallback.
+  try {
+    const ok = await takeToken(env.DB, `rl:${input.session_id}:overpass`, RL_OVERPASS);
+    if (!ok) throw new Error("RATE_LIMIT_OVERPASS");
+
+    const raw = await queryNearbyStores(env, center, radius);
+
+    const stores = raw
+      .map((s) => ({
+        id: s.external_id,
+        name: s.name,
+        lat: s.lat,
+        lon: s.lon,
+        distance_m: Math.round(distanceMeters(center, { lat: s.lat, lon: s.lon })),
+        tags: s.tags
+      }))
+      .sort((a, b) => a.distance_m - b.distance_m)
+      .slice(0, 50);
+
+    await cachePut(env.DB, storesKey, { stores }, TTL_STORES_SEC);
+
+    // Opportunistic upsert into stores table (useful later, not required to return)
+    const t = nowSec();
+    const stmt = env.DB.prepare(
+      "INSERT OR REPLACE INTO stores (id, source, external_id, name, lat, lon, tags_json, last_seen_at) VALUES (?, 'osm', ?, ?, ?, ?, ?, ?)"
+    );
+    const batch = stores.map((st) =>
+      stmt.bind(st.id, st.id, st.name, st.lat, st.lon, JSON.stringify(st.tags ?? {}), t)
+    );
+    await env.DB.batch(batch);
+
+    return {
+      center,
+      radius_m: radius,
+      data_mode: "live",
+      stores,
+      attribution: osmAttribution()
+    };
+  } catch {
+    return seedResponse(env, radius, center);
+  }
+}
+
+function safeJson(s: string | null | undefined): Record<string, string> {
+  if (!s) return {};
+  try {
+    return JSON.parse(s) as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+function osmAttribution() {
+  return {
+    text: "© OpenStreetMap contributors",
+    links: [{ label: "OpenStreetMap", href: "https://www.openstreetmap.org/copyright" }]
+  };
+}
+
+async function seedResponse(
+  env: { DB: D1Database },
+  radius: number,
+  centerOverride?: { lat: number; lon: number }
+): Promise<StoreSearchResponse> {
+  const seed = await env.DB
+    .prepare("SELECT id, name, lat, lon, tags_json FROM stores WHERE source = 'seed'")
+    .all<{ id: string; name: string; lat: number; lon: number; tags_json: string }>();
+
+  const rows = seed.results || [];
+  const center =
+    centerOverride ?? (rows.length ? centerFromSeedRows(rows) : null);
+
+  if (!center) throw new Error("NO_SEED_STORES");
+
+  const stores = rows
+    .map((s) => ({
+      id: s.id,
+      name: s.name,
+      lat: s.lat,
+      lon: s.lon,
+      distance_m: Math.round(distanceMeters(center, { lat: s.lat, lon: s.lon })),
+      tags: safeJson(s.tags_json)
+    }))
+    .sort((a, b) => a.distance_m - b.distance_m);
+
+  return {
+    center,
+    radius_m: radius,
+    data_mode: "seed",
+    stores,
+    attribution: osmAttribution()
+  };
+}
+
+function centerFromSeedRows(rows: Array<{ lat: number; lon: number }>) {
+  if (!rows.length) return null;
+
+  const { lat, lon } = rows.reduce(
+    (acc, row) => {
+      acc.lat += row.lat;
+      acc.lon += row.lon;
+      return acc;
+    },
+    { lat: 0, lon: 0 }
+  );
+
+  return { lat: lat / rows.length, lon: lon / rows.length };
+}
+</file>
+
+<file path="apps/api/src/types/cloudflare-runtime.d.ts">
+/// <reference types="@cloudflare/workers-types" />
+export { };
+</file>
+
+<file path="apps/api/src/types/pricecart-shared.d.ts">
+// Intentionally empty.
+//
+// This file previously provided a stub `declare module "@pricecart/shared"` to unblock builds.
+// `@pricecart/shared` is now a real workspace dependency (packages/shared) that ships its own types.
+
+export { };
+</file>
+
+<file path="apps/api/src/App.css">
+#root {
+	max-width: 1280px;
+	margin: 0 auto;
+	padding: 2rem;
+	text-align: center;
+}
+
+.logo {
+	height: 6em;
+	padding: 1.5em;
+	will-change: filter;
+	transition: filter 300ms;
+}
+.logo:hover {
+	filter: drop-shadow(0 0 2em #646cffaa);
+}
+.logo.react:hover {
+	filter: drop-shadow(0 0 2em #61dafbaa);
+}
+.logo.cloudflare:hover {
+	filter: drop-shadow(0 0 2em #f6821faa);
+}
+
+@keyframes logo-spin {
+	from {
+		transform: rotate(0deg);
+	}
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	a:nth-of-type(2) .logo {
+		animation: logo-spin infinite 20s linear;
+	}
+}
+
+.card {
+	padding: 2em;
+}
+
+.read-the-docs {
+	color: #888;
+}
+</file>
+
+<file path="apps/api/src/App.tsx">
+import { useState } from 'react'
+import reactLogo from './assets/react.svg'
+import viteLogo from '/vite.svg'
+import cloudflareLogo from './assets/Cloudflare_Logo.svg'
+import './App.css'
+
+function App() {
+  const [count, setCount] = useState(0)
+  const [name, setName] = useState('unknown')
+
+  return (
+    <>
+      <div>
+        <a href='https://vite.dev' target='_blank'>
+          <img src={viteLogo} className='logo' alt='Vite logo' />
+        </a>
+        <a href='https://react.dev' target='_blank'>
+          <img src={reactLogo} className='logo react' alt='React logo' />
+        </a>
+        <a href='https://workers.cloudflare.com/' target='_blank'>
+          <img src={cloudflareLogo} className='logo cloudflare' alt='Cloudflare logo' />
+        </a>
+      </div>
+      <h1>Vite + React + Cloudflare</h1>
+      <div className='card'>
+        <button
+          onClick={() => setCount((count) => count + 1)}
+          aria-label='increment'
+        >
+          count is {count}
+        </button>
+        <p>
+          Edit <code>src/App.tsx</code> and save to test HMR
+        </p>
+      </div>
+      <div className='card'>
+        <button
+          onClick={() => {
+            fetch('/api/')
+              .then((res) => res.json() as Promise<{ name: string }>)
+              .then((data) => setName(data.name))
+          }}
+          aria-label='get name'
+        >
+          Name from API is: {name}
+        </button>
+        <p>
+          Edit <code>worker/index.ts</code> to change the name
+        </p>
+      </div>
+      <p className='read-the-docs'>
+        Click on the Vite and React logos to learn more
+      </p>
+    </>
+  )
+}
+
+export default App
+</file>
+
+<file path="apps/api/src/env.ts">
+export type Env = {
+  DB: D1Database;
+  OUTBOUND_USER_AGENT?: string;
+  OUTBOUND_REFERER?: string;
+  OFF_BASE_URL?: string; // optional, defaults to https://world.openfoodfacts.org
+};
+</file>
+
+<file path="apps/api/src/index.css">
+:root {
+  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #242424;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  font-weight: 500;
+  color: #646cff;
+  text-decoration: inherit;
+}
+a:hover {
+  color: #535bf2;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  place-items: center;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+h1 {
+  font-size: 3.2em;
+  line-height: 1.1;
+}
+
+button {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  background-color: #1a1a1a;
+  cursor: pointer;
+  transition: border-color 0.25s;
+}
+button:hover {
+  border-color: #646cff;
+}
+button:focus,
+button:focus-visible {
+  outline: 4px auto -webkit-focus-ring-color;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color: #213547;
+    background-color: #ffffff;
+  }
+  a:hover {
+    color: #747bff;
+  }
+  button {
+    background-color: #f9f9f9;
+  }
+}
+</file>
+
+<file path="apps/api/src/index.ts">
+import { Hono } from "hono";
+import { z } from "zod";
+import type { Env } from "./env";
+import { cors } from "./middleware/cors";
+import { securityHeaders } from "./middleware/security";
+import { productSearch } from "./services/productSearch";
+import { storeSearch } from "./services/storeDiscovery";
+
+const app = new Hono<{ Bindings: Env }>();
+
+// Adjust to your Pages domain once known
+const ALLOWED_ORIGIN = "http://localhost:5173";
+
+app.use("*", securityHeaders());
+app.use("*", cors(ALLOWED_ORIGIN));
+
+app.get("/health", (c) => c.json({ ok: true }));
+
+const StoreSearchQuery = z.object({
+  location: z.string().min(2).max(200),
+  radius_m: z.coerce.number().int().positive().optional(),
+  page: z.coerce.number().int().min(1).optional(),
+  page_size: z.coerce.number().int().min(1).max(50).optional()
+});
+
+const ProductSearchQuery = z.object({
+  q: z.string().min(2).max(200),
+  page: z.coerce.number().int().min(1).optional(),
+  page_size: z.coerce.number().int().min(1).max(50).optional()
+});
+
+function slicePage<T>(items: T[], page: number, pageSize: number): T[] {
+  const start = (page - 1) * pageSize;
+  return items.slice(start, start + pageSize);
+}
+
+app.get("/stores/search", async (c) => {
+  const parsed = StoreSearchQuery.safeParse({
+    location: c.req.query("location"),
+    radius_m: c.req.query("radius_m"),
+    page: c.req.query("page"),
+    page_size: c.req.query("page_size")
+  });
+
+  if (!parsed.success) {
+    return c.json({ error: "INVALID_INPUT", details: parsed.error.flatten() }, 400);
+  }
+
+  const sessionId = c.req.header("x-pricecart-session") || "anon";
+  const page = parsed.data.page ?? 1;
+  const pageSize = parsed.data.page_size ?? 20;
+
+  try {
+    const res = await storeSearch(c.env, {
+      location: parsed.data.location,
+      radius_m: parsed.data.radius_m ?? 5000,
+      session_id: sessionId
+    });
+
+    const totalCount = res.stores.length;
+    const stores = slicePage(res.stores, page, pageSize);
+
+    console.log(
+      JSON.stringify({
+        level: "info",
+        route: "/stores/search",
+        session: sessionId,
+        data_mode: res.data_mode,
+        radius_m: res.radius_m,
+        page,
+        page_size: pageSize,
+        store_count: stores.length,
+        total_count: totalCount
+      })
+    );
+
+    return c.json({
+      ...res,
+      stores,
+      page,
+      page_size: pageSize,
+      total_count: totalCount
+    });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+
+    if (msg.includes("RATE_LIMIT")) return c.json({ error: "RATE_LIMITED" }, 429);
+    if (msg.includes("NOT_FOUND")) return c.json({ error: "NOT_FOUND" }, 404);
+
+    console.log(
+      JSON.stringify({
+        level: "error",
+        route: "/stores/search",
+        session: sessionId,
+        message: "store search failed",
+        err: msg
+      })
+    );
+
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+app.get("/products/search", async (c) => {
+  const parsed = ProductSearchQuery.safeParse({
+    q: c.req.query("q"),
+    page: c.req.query("page"),
+    page_size: c.req.query("page_size")
+  });
+
+  if (!parsed.success) {
+    return c.json({ error: "INVALID_INPUT", details: parsed.error.flatten() }, 400);
+  }
+
+  const sessionId = c.req.header("x-pricecart-session") || "anon";
+  const page = parsed.data.page ?? 1;
+  const pageSize = parsed.data.page_size ?? 10;
+
+  try {
+    const res = await productSearch(c.env, {
+      q: parsed.data.q,
+      page,
+      page_size: pageSize,
+      session_id: sessionId
+    });
+
+    console.log(
+      JSON.stringify({
+        level: "info",
+        route: "/products/search",
+        session: sessionId,
+        q: parsed.data.q,
+        page,
+        page_size: pageSize,
+        product_count: res.products.length,
+        total_count: res.total_count
+      })
+    );
+
+    return c.json(res);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+
+    if (msg.includes("RATE_LIMIT")) return c.json({ error: "RATE_LIMITED" }, 429);
+
+    console.log(
+      JSON.stringify({
+        level: "error",
+        route: "/products/search",
+        session: sessionId,
+        message: "product search failed",
+        err: msg
+      })
+    );
+
+    return c.json({ error: "INTERNAL_ERROR" }, 500);
+  }
+});
+
+export default app;
+</file>
+
+<file path="apps/api/src/main.tsx">
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App";
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>
+);
+</file>
+
+<file path="apps/api/src/vite-env.d.ts">
+/// <reference types="vite/client" />
+</file>
+
+<file path="apps/api/worker/index.ts">
+import type { Env } from "../src/env";
+import app from "../src/index";
+
+export default {
+  async fetch(
+    request: Request,
+    env: Env & { ASSETS?: Fetcher },
+    ctx: ExecutionContext
+  ): Promise<Response> {
+    const url = new URL(request.url);
+
+    // Keep the Vite template demo endpoint working (App.tsx fetches /api/)
+    // BUT do not swallow real API routes like /api/health, /api/stores/search, etc.
+    if (url.pathname === "/api" || url.pathname === "/api/") {
+      return Response.json({ name: "Cloudflare" });
+    }
+
+    const isApiPrefixed = url.pathname.startsWith("/api/");
+
+    // Support both:
+    // - /health, /stores/search, /products/search
+    // - /api/health, /api/stores/search, /api/products/search
+    if (isApiPrefixed) {
+      url.pathname = url.pathname.slice("/api".length) || "/";
+      request = new Request(url.toString(), request);
+    }
+
+    const res = await app.fetch(request, env, ctx);
+
+    // Never fall back to static assets for /api/* calls.
+    if (isApiPrefixed) return res;
+
+    // If the Hono app didn't match, let the SPA/static assets system try (if present).
+    if (res.status === 404 && env.ASSETS?.fetch) {
+      return env.ASSETS.fetch(request);
+    }
+
+    return res;
+  }
+};
+</file>
+
+<file path="apps/api/.gitignore">
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example
+</file>
+
+<file path="apps/api/eslint.config.js">
+import js from '@eslint/js'
+import globals from 'globals'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import tseslint from 'typescript-eslint'
+import { globalIgnores } from 'eslint/config'
+
+export default tseslint.config([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      js.configs.recommended,
+      tseslint.configs.recommended,
+      reactHooks.configs['recommended-latest'],
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      ecmaVersion: 2020,
+      globals: globals.browser,
+    },
+  },
+])
+</file>
+
+<file path="apps/api/index.html">
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vite + React + TS</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+</file>
+
+<file path="apps/api/package.json">
+{
+	"name": "api",
+	"private": true,
+	"version": "0.0.0",
+	"type": "module",
+	"scripts": {
+		"typegen": "wrangler types",
+		"dev": "vite",
+		"build": "npm run -w @pricecart/shared build && npm run typegen && tsc -b && vite build",
+		"lint": "eslint .",
+		"preview": "npm run build && vite preview",
+		"deploy": "npm run build && wrangler deploy",
+		"cf-typegen": "wrangler types",
+		"test": "vitest run",
+		"test:watch": "vitest"
+	},
+	"dependencies": {
+		"@cloudflare/vite-plugin": "1.19.0",
+		"@pricecart/shared": "0.0.1",
+		"hono": "4.11.3",
+		"react": "^19.1.1",
+		"react-dom": "^19.1.1",
+		"zod": "4.2.1"
+	},
+	"devDependencies": {
+		"@eslint/js": "^9.33.0",
+		"@types/node": "25.0.3",
+		"@types/react": "^19.1.10",
+		"@types/react-dom": "^19.1.7",
+		"@vitejs/plugin-react": "^5.0.0",
+		"eslint": "^9.33.0",
+		"eslint-plugin-react-hooks": "^5.2.0",
+		"eslint-plugin-react-refresh": "^0.4.20",
+		"globals": "^16.3.0",
+		"miniflare": "4.20251217.0",
+		"typescript": "~5.8.3",
+		"typescript-eslint": "^8.39.1",
+		"vite": "^7.1.2",
+		"vitest": "4.0.16",
+		"wrangler": "4.54.0"
+	}
+}
+</file>
+
+<file path="apps/api/README.md">
+# React + TypeScript + Vite
+
+This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+
+Currently, two official plugins are available:
+
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) for Fast Refresh
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+
+## Expanding the ESLint configuration
+
+If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+
+```js
+export default tseslint.config([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      // Other configs...
+
+      // Remove tseslint.configs.recommended and replace with this
+      ...tseslint.configs.recommendedTypeChecked,
+      // Alternatively, use this for stricter rules
+      ...tseslint.configs.strictTypeChecked,
+      // Optionally, add this for stylistic rules
+      ...tseslint.configs.stylisticTypeChecked,
+
+      // Other configs...
+    ],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+      // other options...
+    },
+  },
+])
+```
+
+You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+
+```js
+// eslint.config.js
+import reactX from 'eslint-plugin-react-x'
+import reactDom from 'eslint-plugin-react-dom'
+
+export default tseslint.config([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      // Other configs...
+      // Enable lint rules for React
+      reactX.configs['recommended-typescript'],
+      // Enable lint rules for React DOM
+      reactDom.configs.recommended,
+    ],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+      // other options...
+    },
+  },
+])
+```
+</file>
+
+<file path="apps/api/tsconfig.app.json">
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true
+  },
+  "include": ["src"]
+}
+</file>
+
+<file path="apps/api/tsconfig.client.json">
+{
+  "compilerOptions": {
+    "composite": true,
+    "tsBuildInfoFile": "./node_modules/.cache/tsconfig.client.tsbuildinfo",
+
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+
+    "jsx": "react-jsx",
+
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "src/**/*.d.ts"
+  ],
+  "exclude": [
+    "worker/**",
+    "src/**/*.test.*",
+    "src/**/*.spec.*"
+  ]
+}
+</file>
+
+<file path="apps/api/tsconfig.json">
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.worker.json" },
+    { "path": "./tsconfig.client.json" }
+  ]
+}
+</file>
+
+<file path="apps/api/tsconfig.node.json">
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true
+  },
+  "include": ["vite.config.ts"]
+}
+</file>
+
+<file path="apps/api/tsconfig.tsbuildinfo">
+{"root":["./src/env.ts","./src/index.ts","./src/vite-env.d.ts","./src/lib/cache.ts","./src/lib/circuitbreaker.ts","./src/lib/geo.ts","./src/lib/hash.ts","./src/lib/ratelimit.test.ts","./src/lib/ratelimit.ts","./src/lib/time.ts","./src/middleware/cors.ts","./src/middleware/security.ts","./src/providers/nominatim.ts","./src/providers/overpass.ts","./src/services/storediscovery.ts","./src/types/cloudflare-runtime.d.ts","./src/types/pricecart-shared.d.ts","./src/app.tsx","./src/main.tsx","./worker-configuration.d.ts"],"errors":true,"version":"5.8.3"}
+</file>
+
+<file path="apps/api/tsconfig.worker.json">
+{
+  "compilerOptions": {
+    "composite": true,
+    "tsBuildInfoFile": "./node_modules/.cache/tsconfig.worker.tsbuildinfo",
+
+    "target": "ES2022",
+    "lib": ["ES2022"],
+
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+
+    "types": ["./worker-configuration.d.ts"]
+  },
+  "include": [
+    "worker/**/*.ts",
+    "src/**/*.ts",
+    "src/**/*.d.ts"
+  ],
+  "exclude": [
+    "src/**/*.tsx",
+    "src/**/*.test.*",
+    "src/**/*.spec.*",
+    "src/vite-env.d.ts"
+  ]
+}
+</file>
+
+<file path="apps/api/vite.config.ts">
+import { cloudflare } from "@cloudflare/vite-plugin";
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+
+// https://vite.dev/config/
+export default defineConfig(({ mode }) => {
+  // Vitest runs Vite in "test" mode and sets VITEST in the config process env.
+  const isVitest = !!process.env.VITEST || mode === "test";
+
+  return {
+    plugins: isVitest ? [react()] : [react(), cloudflare()],
+  };
+});
+</file>
+
+<file path="apps/api/wrangler.jsonc">
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "api",
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-12-25",
+
+  "observability": { "enabled": true },
+
+  "vars": {
+    "OUTBOUND_USER_AGENT": "PriceCart/0.1 (contact: you@example.com)",
+    "OUTBOUND_REFERER": "http://localhost:5173",
+    "OFF_BASE_URL": "https://world.openfoodfacts.org"
+  },
+
+  "assets": {
+    "not_found_handling": "single-page-application",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/health", "/stores/*", "/products/*"]
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "pricecart",
+      "database_id": "f0f7e12d-54da-4aa0-a94e-d84a80a71169"
+    }
+  ]
+}
+</file>
+
+<file path="apps/api/wrangler.toml">
+name = "api"
+main = "worker/index.ts"
+compatibility_date = "2025-12-25"
+
+[observability]
+enabled = true
+
+[vars]
+OUTBOUND_USER_AGENT = "PriceCart/0.1 (contact: you@example.com)"
+OUTBOUND_REFERER = "http://localhost:5173"
+OFF_BASE_URL = "https://world.openfoodfacts.org"
+
+[assets]
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*", "/health", "/stores/*", "/products/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "pricecart"
+database_id = "f0f7e12d-54da-4aa0-a94e-d84a80a71169"
+</file>
+
+<file path="apps/web/src/lib/api.ts">
+import type { ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
+import { getSessionId } from "./session";
+
+async function fetchJson<T>(url: string): Promise<T> {
+  const res = await fetch(url, {
+    headers: {
+      "x-pricecart-session": getSessionId()
+    }
+  });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body?.error || `HTTP_${res.status}`);
+  }
+
+  return (await res.json()) as T;
+}
+
+export async function fetchStores(params: { location: string; radius_m: number }): Promise<StoreSearchResponse> {
+  const base = import.meta.env.VITE_API_BASE_URL;
+  const url = new URL(base + "/stores/search");
+  url.searchParams.set("location", params.location);
+  url.searchParams.set("radius_m", String(params.radius_m));
+  return fetchJson<StoreSearchResponse>(url.toString());
+}
+
+export async function lookupProductByUpc(upc: string): Promise<ProductLookupResponse> {
+  const base = import.meta.env.VITE_API_BASE_URL;
+  const url = new URL(base + `/products/lookup/${encodeURIComponent(upc)}`);
+  return fetchJson<ProductLookupResponse>(url.toString());
+}
+
+export async function searchProducts(params: { q: string; page?: number; page_size?: number }): Promise<ProductSearchResponse> {
+  const base = import.meta.env.VITE_API_BASE_URL;
+  const url = new URL(base + "/products/search");
+  url.searchParams.set("q", params.q);
+  url.searchParams.set("page", String(params.page ?? 1));
+  url.searchParams.set("page_size", String(params.page_size ?? 10));
+  return fetchJson<ProductSearchResponse>(url.toString());
+}
+</file>
+
+<file path="apps/web/src/lib/session.ts">
+export function getSessionId(): string {
+  const k = "pricecart_session";
+  const existing = localStorage.getItem(k);
+  if (existing) return existing;
+  const v = crypto.randomUUID();
+  localStorage.setItem(k, v);
+  return v;
+}
+</file>
+
+<file path="apps/web/src/App.css">
+#root {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 2rem;
+  text-align: center;
+}
+
+.logo {
+  height: 6em;
+  padding: 1.5em;
+  will-change: filter;
+  transition: filter 300ms;
+}
+.logo:hover {
+  filter: drop-shadow(0 0 2em #646cffaa);
+}
+.logo.react:hover {
+  filter: drop-shadow(0 0 2em #61dafbaa);
+}
+
+@keyframes logo-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  a:nth-of-type(2) .logo {
+    animation: logo-spin infinite 20s linear;
+  }
+}
+
+.card {
+  padding: 2em;
+}
+
+.read-the-docs {
+  color: #888;
+}
+</file>
+
+<file path="apps/web/src/App.tsx">
+import type { Product, ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
+import "leaflet/dist/leaflet.css";
+import { useMemo, useState } from "react";
+import { MapContainer, Marker, Popup, TileLayer } from "react-leaflet";
+import { fetchStores, lookupProductByUpc, searchProducts } from "./lib/api";
+
+function formatErrorMessage(err: unknown) {
+  return err instanceof Error ? err.message : String(err);
+}
+
+export default function App() {
+  const [view, setView] = useState<"stores" | "products">("stores");
+
+  // Phase 1: Stores
+  const [location, setLocation] = useState("10001");
+  const [radius, setRadius] = useState(1500);
+  const [storesData, setStoresData] = useState<StoreSearchResponse | null>(null);
+  const [status, setStatus] = useState<string>("");
+
+  const center = useMemo(() => {
+    if (!storesData) return { lat: 40.7484, lon: -73.9857 };
+    return storesData.center;
+  }, [storesData]);
+
+  async function onStoreSearch() {
+    setStatus("Searching...");
+    try {
+      const res = await fetchStores({ location, radius_m: radius });
+      setStoresData(res);
+      setStatus(res.data_mode === "live" ? "" : `Using ${res.data_mode} data`);
+    } catch (e: unknown) {
+      setStatus(`Error: ${formatErrorMessage(e)}`);
+    }
+  }
+
+  // Phase 2: Products
+  const [upc, setUpc] = useState("");
+  const [lookup, setLookup] = useState<ProductLookupResponse | null>(null);
+  const [q, setQ] = useState("");
+  const [search, setSearch] = useState<ProductSearchResponse | null>(null);
+  const [pStatus, setPStatus] = useState<string>("");
+
+  type CartItem = { upc: string; name: string; brand: string | null; quantityLabel: string; count: number };
+  const [cart, setCart] = useState<CartItem[]>([]);
+
+  function addToCart(p: Product) {
+    const label = p.quantity?.raw || (p.quantity?.value && p.quantity?.unit ? `${p.quantity.value} ${p.quantity.unit}` : "");
+
+    setCart((prev) => {
+      const ix = prev.findIndex((x) => x.upc === p.upc);
+      if (ix >= 0) {
+        const copy = [...prev];
+        copy[ix] = { ...copy[ix], count: copy[ix].count + 1 };
+        return copy;
+      }
+      return [...prev, { upc: p.upc, name: p.name, brand: p.brand ?? null, quantityLabel: label, count: 1 }];
+    });
+  }
+
+  function removeFromCart(upc: string) {
+    setCart((prev) => prev.filter((x) => x.upc !== upc));
+  }
+
+  async function onLookup() {
+    setPStatus("Looking up...");
+    setLookup(null);
+    try {
+      const res = await lookupProductByUpc(upc);
+      setLookup(res);
+      setPStatus(res.data_mode === "live" ? "" : `Using ${res.data_mode}${res.cache_state ? ` (${res.cache_state})` : ""}`);
+    } catch (e: unknown) {
+      setPStatus(`Error: ${formatErrorMessage(e)}`);
+    }
+  }
+
+  async function onSearchProducts() {
+    setPStatus("Searching products...");
+    setSearch(null);
+    try {
+      const res = await searchProducts({ q, page: 1, page_size: 10 });
+      setSearch(res);
+      setPStatus(res.data_mode === "live" ? "" : `Using ${res.data_mode}${res.cache_state ? ` (${res.cache_state})` : ""}`);
+    } catch (e: unknown) {
+      setPStatus(`Error: ${formatErrorMessage(e)}`);
+    }
+  }
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "420px 1fr", height: "100vh" }}>
+      <div style={{ padding: 16, overflow: "auto", borderRight: "1px solid #eee" }}>
+        <h1 style={{ marginTop: 0 }}>PriceCart</h1>
+        <p style={{ marginTop: 0, opacity: 0.8 }}>Phase 1: Stores • Phase 2: Product identity</p>
+
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <button onClick={() => setView("stores")} style={{ padding: "8px 12px", opacity: view === "stores" ? 1 : 0.6 }}>
+            Stores
+          </button>
+          <button onClick={() => setView("products")} style={{ padding: "8px 12px", opacity: view === "products" ? 1 : 0.6 }}>
+            Products
+          </button>
+        </div>
+
+        {view === "stores" ? (
+          <>
+            <h2 style={{ marginTop: 8 }}>Stores</h2>
+
+            <label style={{ display: "block", fontWeight: 600 }}>ZIP / Address</label>
+            <input
+              value={location}
+              onChange={(e) => setLocation(e.target.value)}
+              style={{ width: "100%", padding: 8, margin: "8px 0" }}
+              placeholder="10001"
+            />
+
+            <label style={{ display: "block", fontWeight: 600 }}>Radius (meters)</label>
+            <input
+              type="number"
+              value={radius}
+              onChange={(e) => setRadius(Number(e.target.value))}
+              style={{ width: "100%", padding: 8, margin: "8px 0" }}
+              min={250}
+              max={20000}
+            />
+
+            <button onClick={onStoreSearch} style={{ padding: "8px 12px" }}>
+              Search stores
+            </button>
+
+            {status && <p style={{ marginTop: 12, padding: 10, background: "#f7f7f7" }}>{status}</p>}
+
+            {storesData?.stores?.length ? (
+              <>
+                <h3>Results</h3>
+                <ol>
+                  {storesData.stores.map((s) => (
+                    <li key={s.id}>
+                      <div style={{ fontWeight: 600 }}>{s.name}</div>
+                      <div style={{ opacity: 0.8 }}>{Math.round(s.distance_m)} m</div>
+                    </li>
+                  ))}
+                </ol>
+
+                {storesData.data_mode !== "live" ? (
+                  <p style={{ fontSize: 12, opacity: 0.75 }}>
+                    Live providers may be rate limited or temporarily unavailable. This view is still valid for demos.
+                  </p>
+                ) : null}
+
+                <footer style={{ marginTop: 16, fontSize: 12, opacity: 0.8 }}>
+                  <div>{storesData.attribution.text}</div>
+                  <div>
+                    {storesData.attribution.links.map((l) => (
+                      <a key={l.href} href={l.href} target="_blank" rel="noreferrer" style={{ marginRight: 8 }}>
+                        {l.label}
+                      </a>
+                    ))}
+                  </div>
+                </footer>
+              </>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <h2 style={{ marginTop: 8 }}>Products</h2>
+
+            <h3>UPC lookup</h3>
+            <label style={{ display: "block", fontWeight: 600 }}>UPC (8–14 digits)</label>
+            <input
+              value={upc}
+              onChange={(e) => setUpc(e.target.value)}
+              style={{ width: "100%", padding: 8, margin: "8px 0" }}
+              placeholder="0123456789012"
+            />
+            <button onClick={onLookup} style={{ padding: "8px 12px" }}>
+              Lookup
+            </button>
+
+            <h3 style={{ marginTop: 16 }}>Text search</h3>
+            <label style={{ display: "block", fontWeight: 600 }}>Search</label>
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              style={{ width: "100%", padding: 8, margin: "8px 0" }}
+              placeholder="milk"
+            />
+            <button onClick={onSearchProducts} style={{ padding: "8px 12px" }}>
+              Search
+            </button>
+
+            {pStatus && <p style={{ marginTop: 12, padding: 10, background: "#f7f7f7" }}>{pStatus}</p>}
+
+            {lookup?.product ? (
+              <>
+                <h3 style={{ marginTop: 16 }}>Lookup result</h3>
+                <div style={{ padding: 12, border: "1px solid #eee", borderRadius: 8 }}>
+                  <div style={{ display: "flex", gap: 12 }}>
+                    {lookup.product.image_url ? (
+                      <img src={lookup.product.image_url} alt="" style={{ width: 72, height: 72, objectFit: "cover" }} />
+                    ) : null}
+                    <div>
+                      <div style={{ fontWeight: 700 }}>{lookup.product.name}</div>
+                      <div style={{ opacity: 0.8 }}>{lookup.product.brand ?? ""}</div>
+                      <div style={{ fontSize: 12, opacity: 0.8 }}>UPC: {lookup.product.upc}</div>
+                    </div>
+                  </div>
+
+                  <button onClick={() => addToCart(lookup.product)} style={{ marginTop: 12, padding: "8px 12px" }}>
+                    Add to cart
+                  </button>
+
+                  <div style={{ marginTop: 12, fontSize: 12, opacity: 0.8 }}>
+                    <div>{lookup.attribution.text}</div>
+                    <div>
+                      {lookup.attribution.links.map((l) => (
+                        <a key={l.href} href={l.href} target="_blank" rel="noreferrer" style={{ marginRight: 8 }}>
+                          {l.label}
+                        </a>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </>
+            ) : null}
+
+            {search?.products?.length ? (
+              <>
+                <h3 style={{ marginTop: 16 }}>Search results</h3>
+                <ul style={{ paddingLeft: 18 }}>
+                  {search.products.map((p) => (
+                    <li key={p.upc} style={{ marginBottom: 8 }}>
+                      <div style={{ fontWeight: 600 }}>{p.name}</div>
+                      <div style={{ fontSize: 12, opacity: 0.8 }}>{p.brand ?? ""} • {p.upc}</div>
+                      <button onClick={() => addToCart(p)} style={{ marginTop: 6, padding: "6px 10px" }}>
+                        Add
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+
+                <div style={{ marginTop: 12, fontSize: 12, opacity: 0.8 }}>
+                  <div>{search.attribution.text}</div>
+                  <div>
+                    {search.attribution.links.map((l) => (
+                      <a key={l.href} href={l.href} target="_blank" rel="noreferrer" style={{ marginRight: 8 }}>
+                        {l.label}
+                      </a>
+                    ))}
+                  </div>
+                </div>
+              </>
+            ) : null}
+
+            <h3 style={{ marginTop: 16 }}>Cart (local)</h3>
+            {cart.length ? (
+              <ul style={{ paddingLeft: 18 }}>
+                {cart.map((x) => (
+                  <li key={x.upc} style={{ marginBottom: 8 }}>
+                    <div style={{ fontWeight: 600 }}>
+                      {x.name} {x.count > 1 ? `×${x.count}` : ""}
+                    </div>
+                    <div style={{ fontSize: 12, opacity: 0.8 }}>{x.brand ?? ""} • {x.upc} {x.quantityLabel ? `• ${x.quantityLabel}` : ""}</div>
+                    <button onClick={() => removeFromCart(x.upc)} style={{ marginTop: 6, padding: "6px 10px" }}>
+                      Remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p style={{ opacity: 0.8 }}>Cart is empty.</p>
+            )}
+          </>
+        )}
+      </div>
+
+      <div style={{ height: "100%" }}>
+        <MapContainer center={[center.lat, center.lon]} zoom={13} style={{ height: "100%", width: "100%" }}>
+          <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="&copy; OpenStreetMap contributors" />
+          {storesData?.stores?.map((s) => (
+            <Marker key={s.id} position={[s.lat, s.lon]}>
+              <Popup>
+                <strong>{s.name}</strong>
+                <br />
+                {Math.round(s.distance_m)} m
+              </Popup>
+            </Marker>
+          ))}
+        </MapContainer>
+      </div>
+    </div>
+  );
+}
+</file>
+
+<file path="apps/web/src/index.css">
+:root {
+  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #242424;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  font-weight: 500;
+  color: #646cff;
+  text-decoration: inherit;
+}
+a:hover {
+  color: #535bf2;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  place-items: center;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+h1 {
+  font-size: 3.2em;
+  line-height: 1.1;
+}
+
+button {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  background-color: #1a1a1a;
+  cursor: pointer;
+  transition: border-color 0.25s;
+}
+button:hover {
+  border-color: #646cff;
+}
+button:focus,
+button:focus-visible {
+  outline: 4px auto -webkit-focus-ring-color;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color: #213547;
+    background-color: #ffffff;
+  }
+  a:hover {
+    color: #747bff;
+  }
+  button {
+    background-color: #f9f9f9;
+  }
+}
+</file>
+
+<file path="apps/web/src/main.tsx">
+import "leaflet/dist/leaflet.css";
+
+import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App";
+import "./index.css";
+
+ReactDOM.createRoot(document.getElementById("root")!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+</file>
+
+<file path="apps/web/.env">
+VITE_API_BASE_URL=http://localhost:8787
+</file>
+
+<file path="apps/web/.env.example">
+VITE_API_BASE_URL=http://localhost:8787
+</file>
+
+<file path="apps/web/.gitignore">
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+</file>
+
+<file path="apps/web/eslint.config.js">
+import js from '@eslint/js'
+import globals from 'globals'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import tseslint from 'typescript-eslint'
+import { defineConfig, globalIgnores } from 'eslint/config'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      js.configs.recommended,
+      tseslint.configs.recommended,
+      reactHooks.configs.flat.recommended,
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      ecmaVersion: 2020,
+      globals: globals.browser,
+    },
+  },
+])
+</file>
+
+<file path="apps/web/index.html">
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>web</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+</file>
+
+<file path="apps/web/package.json">
+{
+  "name": "web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@pricecart/shared": "file:../../packages/shared",
+    "leaflet": "1.9.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-leaflet": "5.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/leaflet": "1.9.21",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "eslint": "^9.39.1",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.4.24",
+    "globals": "^16.5.0",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.46.4",
+    "vite": "^7.2.4"
+  }
+}
+</file>
+
+<file path="apps/web/README.md">
+# React + TypeScript + Vite
+
+This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+
+Currently, two official plugins are available:
+
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+
+## React Compiler
+
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+
+## Expanding the ESLint configuration
+
+If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+
+```js
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      // Other configs...
+
+      // Remove tseslint.configs.recommended and replace with this
+      tseslint.configs.recommendedTypeChecked,
+      // Alternatively, use this for stricter rules
+      tseslint.configs.strictTypeChecked,
+      // Optionally, add this for stylistic rules
+      tseslint.configs.stylisticTypeChecked,
+
+      // Other configs...
+    ],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+      // other options...
+    },
+  },
+])
+```
+
+You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+
+```js
+// eslint.config.js
+import reactX from 'eslint-plugin-react-x'
+import reactDom from 'eslint-plugin-react-dom'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      // Other configs...
+      // Enable lint rules for React
+      reactX.configs['recommended-typescript'],
+      // Enable lint rules for React DOM
+      reactDom.configs.recommended,
+    ],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+      // other options...
+    },
+  },
+])
+```
+</file>
+
+<file path="apps/web/tsconfig.app.json">
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "types": ["vite/client"],
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true
+  },
+  "include": ["src"]
+}
+</file>
+
+<file path="apps/web/tsconfig.json">
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ]
+}
+</file>
+
+<file path="apps/web/tsconfig.node.json">
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "types": ["node"],
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true
+  },
+  "include": ["vite.config.ts"]
+}
+</file>
+
+<file path="apps/web/vite.config.ts">
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [react()],
+})
+</file>
+
+<file path="packages/shared/src/index.ts">
+export * from "./product";
+export * from "./store";
+</file>
+
+<file path="packages/shared/src/product.ts">
+import { z } from "zod";
+
+export const QuantitySchema = z.object({
+  raw: z.string().nullable().default(null),
+  value: z.number().nullable().default(null),
+  unit: z.string().nullable().default(null)
+});
+
+export const ProductSchema = z.object({
+  upc: z.string(),
+  name: z.string(),
+  brand: z.string().nullable().default(null),
+  normalized_name: z.string(),
+  quantity: QuantitySchema,
+  image_url: z.string().url().nullable().default(null),
+  source: z.enum(["openfoodfacts", "seed"]),
+  source_url: z.string().url().nullable().default(null),
+  updated_at: z.number().int()
+});
+
+export type Product = z.infer<typeof ProductSchema>;
+
+export const ProductSummarySchema = ProductSchema;
+export type ProductSummary = z.infer<typeof ProductSummarySchema>;
+
+export const AttributionSchema = z.object({
+  text: z.string(),
+  links: z.array(z.object({ label: z.string(), href: z.string().url() }))
+});
+
+export const ProductLookupResponseSchema = z.object({
+  data_mode: z.enum(["live", "cache", "seed"]),
+  cache_state: z.enum(["fresh", "stale"]).optional(),
+  product: ProductSchema,
+  attribution: AttributionSchema
+});
+export type ProductLookupResponse = z.infer<typeof ProductLookupResponseSchema>;
+
+export const ProductSearchResponseSchema = z.object({
+  data_mode: z.enum(["live", "cache"]),
+  cache_state: z.enum(["fresh", "stale"]).optional(),
+  query: z.string(),
+  page: z.number().int().positive(),
+  page_size: z.number().int().positive(),
+  total: z.number().int().nonnegative(),
+  products: z.array(ProductSummarySchema),
+  attribution: AttributionSchema
+});
+export type ProductSearchResponse = z.infer<typeof ProductSearchResponseSchema>;
+
+// -------------------------
+// Normalization helpers
+// -------------------------
+
+export type Synonyms = Record<string, string[]>; // canonical -> synonyms
+
+const DEFAULT_SYNONYMS: Synonyms = {
+  oz: ["ounce", "ounces"],
+  lb: ["lbs", "pound", "pounds"],
+  pcs: ["pc", "piece", "pieces"],
+  ea: ["each"]
+};
+
+function buildSynonymMap(s: Synonyms): Record<string, string> {
+  const m: Record<string, string> = {};
+  for (const [canon, alts] of Object.entries(s)) {
+    m[canon] = canon;
+    for (const a of alts) m[a] = canon;
+  }
+  return m;
+}
+
+export function normalizeText(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function normalizeProductName(args: {
+  name: string;
+  brand?: string | null;
+  synonyms?: Synonyms;
+}): string {
+  const synMap = buildSynonymMap(args.synonyms ?? DEFAULT_SYNONYMS);
+
+  const base = normalizeText(`${args.brand ?? ""} ${args.name}`);
+  const tokens = base.split(" ").filter(Boolean);
+
+  const normalized = tokens.map((t) => synMap[t] ?? t);
+  return normalized.join(" ");
+}
+
+export function parseQuantity(raw: string | null | undefined): { raw: string | null; value: number | null; unit: string | null } {
+  if (!raw) return { raw: null, value: null, unit: null };
+
+  // Examples seen in the wild: "500 g", "1L", "16 oz", "0.5 kg"
+  const s = raw.trim();
+
+  const m = s.match(/^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]+)\s*$/);
+  if (!m) return { raw: s, value: null, unit: null };
+
+  const value = Number(m[1]);
+  if (!Number.isFinite(value)) return { raw: s, value: null, unit: null };
+
+  const unitRaw = m[2].toLowerCase();
+  const unit = normalizeUnit(unitRaw);
+
+  return { raw: s, value, unit };
+}
+
+function normalizeUnit(u: string): string | null {
+  const map: Record<string, string> = {
+    g: "g",
+    gram: "g",
+    grams: "g",
+    kg: "kg",
+    ml: "ml",
+    l: "l",
+    liter: "l",
+    liters: "l",
+    oz: "oz",
+    ounce: "oz",
+    ounces: "oz",
+    lb: "lb",
+    lbs: "lb",
+    ct: "ct",
+    count: "ct",
+    ea: "ea"
+  };
+  return map[u] ?? null;
+}
+</file>
+
+<file path="packages/shared/src/store.ts">
+import { z } from "zod";
+
+export const StoreTagSetSchema = z.record(z.string(), z.string()).default({});
+
+export const StoreSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  lat: z.number(),
+  lon: z.number(),
+  distance_m: z.number().nonnegative(),
+  tags: StoreTagSetSchema
+});
+
+export type Store = z.infer<typeof StoreSchema>;
+
+export const StoreSearchResponseSchema = z.object({
+  center: z.object({ lat: z.number(), lon: z.number() }),
+  radius_m: z.number().int().positive(),
+  data_mode: z.enum(["live", "cache", "seed"]),
+  stores: z.array(StoreSchema),
+  attribution: z.object({
+    text: z.string(),
+    links: z.array(z.object({ label: z.string(), href: z.string() }))
+  })
+});
+
+export type StoreSearchResponse = z.infer<typeof StoreSearchResponseSchema>;
+</file>
+
+<file path="packages/shared/package.json">
+{
+  "name": "@pricecart/shared",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "zod": "4.2.1"
+  },
+  "devDependencies": {
+    "typescript": "~5.8.3"
+  }
+}
+</file>
+
+<file path="packages/shared/tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "declaration": true,
+    "outDir": "dist",
+    "strict": true
+  },
+  "include": ["src"]
+}
+</file>
+
+<file path=".gitignore">
+
+</file>
+
+<file path=".repomixignore">
+apps/api/.git/
+*.svg
+apps/api/worker-configuration.d.ts
+packages/shared/dist/
+</file>
+
+<file path="package.json">
+{
+  "name": "pricecart",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run -ws --if-present dev",
+    "test": "npm run -ws --if-present test",
+    "lint": "npm run -ws --if-present lint",
+    "typecheck": "npm run -ws --if-present typecheck",
+    "build": "npm run -ws --if-present build"
+  },
+  "dependencies": {
+    "hono": "4.11.3",
+    "zod": "4.2.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20251225.0",
+    "@types/node": "25.0.3",
+    "miniflare": "4.20251217.0",
+    "vitest": "4.0.16"
+  }
+}
+</file>
+
+</files>

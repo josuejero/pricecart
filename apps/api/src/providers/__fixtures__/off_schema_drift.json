@@ -1,0 +1,10 @@
+{
+  "status": 1,
+  "product": {
+    "code": "0123456789012",
+    "product_name": "Fixture Granola Bar",
+    "brands": "Fixture Brand",
+    "quantity": "40 g",
+    "some_new_field": { "nested": true }
+  }
+}

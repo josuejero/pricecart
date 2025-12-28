@@ -1,0 +1,32 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "api",
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-12-25",
+
+  "observability": { "enabled": true },
+
+  "vars": {
+    "OUTBOUND_USER_AGENT": "PriceCart/0.1 (contact: you@example.com)",
+    "OUTBOUND_REFERER": "http://localhost:5173",
+    "OFF_BASE_URL": "https://world.openfoodfacts.org"
+  },
+
+  "assets": {
+    "not_found_handling": "single-page-application",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/health", "/stores/*", "/products/*"]
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "pricecart",
+      "database_id": "f0f7e12d-54da-4aa0-a94e-d84a80a71169"
+    }
+  ]
+}

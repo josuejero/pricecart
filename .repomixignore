@@ -1,0 +1,4 @@
+apps/api/.git/
+*.svg
+apps/api/worker-configuration.d.ts
+packages/shared/dist/

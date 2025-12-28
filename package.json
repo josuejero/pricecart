@@ -1,0 +1,25 @@
+{
+  "name": "pricecart",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run -ws --if-present dev",
+    "test": "npm run -ws --if-present test",
+    "lint": "npm run -ws --if-present lint",
+    "typecheck": "npm run -ws --if-present typecheck",
+    "build": "npm run -ws --if-present build"
+  },
+  "dependencies": {
+    "hono": "4.11.3",
+    "zod": "4.2.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20251225.0",
+    "@types/node": "25.0.3",
+    "miniflare": "4.20251217.0",
+    "vitest": "4.0.16"
+  }
+}

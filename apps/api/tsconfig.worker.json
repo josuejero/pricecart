@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "tsBuildInfoFile": "./node_modules/.cache/tsconfig.worker.tsbuildinfo",
+
+    "target": "ES2022",
+    "lib": ["ES2022"],
+
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+
+    "types": ["./worker-configuration.d.ts"]
+  },
+  "include": [
+    "worker/**/*.ts",
+    "src/**/*.ts",
+    "src/**/*.d.ts"
+  ],
+  "exclude": [
+    "src/**/*.tsx",
+    "src/**/*.test.*",
+    "src/**/*.spec.*",
+    "src/vite-env.d.ts"
+  ]
+}

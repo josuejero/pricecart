@@ -1,0 +1,12 @@
+{
+  "status": 1,
+  "product": {
+    "code": "0123456789012",
+    "product_name": "Fixture Granola Bar",
+    "brands": "Fixture Brand",
+    "quantity": "40 g",
+    "image_front_url": "https://example.com/img.jpg",
+    "url": "https://world.openfoodfacts.org/product/0123456789012",
+    "last_modified_t": 1700000000
+  }
+}

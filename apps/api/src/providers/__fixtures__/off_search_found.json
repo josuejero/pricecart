@@ -1,0 +1,21 @@
+{
+  "count": 2,
+  "page": 1,
+  "page_size": 10,
+  "products": [
+    {
+      "code": "0123456789012",
+      "product_name": "Fixture Granola Bar",
+      "brands": "Fixture Brand",
+      "quantity": "40 g",
+      "url": "https://world.openfoodfacts.org/product/0123456789012"
+    },
+    {
+      "code": "0000000000001",
+      "product_name": "Fixture Milk",
+      "brands": "Fixture Brand",
+      "quantity": "1 L",
+      "url": "https://world.openfoodfacts.org/product/0000000000001"
+    }
+  ]
+}
