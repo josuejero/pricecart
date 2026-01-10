@@ -4,6 +4,11 @@
     "target": "ES2023",
     "lib": ["ES2023"],
     "module": "ESNext",
+    "baseUrl": ".",
+    "paths": {
+      "@pricecart/shared": ["../../packages/shared/src"],
+      "@pricecart/shared/*": ["../../packages/shared/src/*"]
+    },
     "types": ["node"],
     "skipLibCheck": true,
 

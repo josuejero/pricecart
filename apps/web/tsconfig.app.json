@@ -5,6 +5,11 @@
     "useDefineForClassFields": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
+    "baseUrl": ".",
+    "paths": {
+      "@pricecart/shared": ["../../packages/shared/src"],
+      "@pricecart/shared/*": ["../../packages/shared/src/*"]
+    },
     "types": ["vite/client"],
     "skipLibCheck": true,
 

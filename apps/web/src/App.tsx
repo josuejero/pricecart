@@ -1,4 +1,14 @@
-import type { CartLine, CartQuoteResponse, Product, ProductLookupResponse, ProductSearchResponse, StoreSearchResponse } from "@pricecart/shared";
+import type {
+  CartLine,
+  CartQuoteResponse,
+  Product,
+  ProductLookupResponse,
+  ProductSearchResponse,
+  QuoteLine,
+  QuoteStore,
+  Store,
+  StoreSearchResponse
+} from "@pricecart/shared";
 import "leaflet/dist/leaflet.css";
 import { useMemo, useState } from "react";
 import { MapContainer, Marker, Popup, TileLayer } from "react-leaflet";
@@ -72,6 +82,7 @@ const ATTRIBUTION_META = {
 const ATTRIBUTION_ORDER = ["osm", "nominatim", "overpass", "openfoodfacts", "openprices", "kroger"] as const;
 
 type AttributionId = (typeof ATTRIBUTION_ORDER)[number];
+type StoreAttributionLink = StoreSearchResponse["attribution"]["links"][number];
 
 export default function App() {
   const [view, setView] = useState<"stores" | "products" | "cart">("stores");
@@ -182,7 +193,7 @@ export default function App() {
     setQuote(null);
 
     try {
-      const storeIds = (stores?.stores ?? []).slice(0, 3).map((s) => s.id);
+      const storeIds = (stores?.stores ?? []).slice(0, 3).map((s: Store) => s.id);
       if (storeIds.length === 0) {
         setQuoteStatus("Search stores first (Phase 1). Then compare.");
         return;
@@ -272,7 +283,7 @@ export default function App() {
               <div style={{ height: 360, borderRadius: 12, overflow: "hidden", border: "1px solid #ddd" }}>
                 <MapContainer center={[mapCenter.lat, mapCenter.lon]} zoom={14} style={{ height: "100%" }}>
                   <TileLayer attribution="&copy; OpenStreetMap" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-                  {stores.stores.map((s) => (
+                  {stores.stores.map((s: Store) => (
                     <Marker key={s.id} position={[s.lat, s.lon]}>
                       <Popup>
                         <b>{s.name}</b>
@@ -285,7 +296,7 @@ export default function App() {
 
               <h4>Results</h4>
               <ul>
-                {stores.stores.map((s) => (
+                {stores.stores.map((s: Store) => (
                   <li key={s.id}>
                     <b>{s.name}</b> - {Math.round(s.distance_m)}m
                   </li>
@@ -293,7 +304,7 @@ export default function App() {
               </ul>
 
               <small>
-                {stores.attribution.text} {stores.attribution.links.map((l) => (
+                {stores.attribution.text} {stores.attribution.links.map((l: StoreAttributionLink) => (
                   <a key={l.href} href={l.href} target="_blank" rel="noreferrer" style={{ marginLeft: 8 }}>
                     {l.label}
                   </a>
@@ -354,7 +365,7 @@ export default function App() {
                   Results: <b>{search.total}</b>
                 </p>
                 <ul style={{ display: "grid", gap: 8, paddingLeft: 16 }}>
-                  {search.products.map((p) => (
+                  {search.products.map((p: Product) => (
                     <li key={p.upc} style={{ display: "flex", gap: 8, alignItems: "center" }}>
                       <span style={{ flex: 1 }}>
                         <b>{p.name}</b> {p.brand ? <span style={{ opacity: 0.8 }}>({p.brand})</span> : null}
@@ -395,7 +406,7 @@ export default function App() {
               </p>
 
               <ul style={{ display: "grid", gap: 12, paddingLeft: 16 }}>
-                {cart.cart.items.map((it) => (
+                {cart.cart.items.map((it: CartLine) => (
                   <li key={it.upc} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8 }}>
                     <div>
                       <b>{it.name}</b>
@@ -470,7 +481,7 @@ export default function App() {
                   <ul style={{ display: "grid", gap: 12, paddingLeft: 16 }}>
                     {[...quote.stores]
                       .sort((a, b) => a.adjusted_total_cents - b.adjusted_total_cents)
-                      .map((s) => (
+                      .map((s: QuoteStore) => (
                         <li key={s.store_id}>
                           <b>{s.store_name}</b> ({s.store_id})
                           <div>
@@ -483,7 +494,7 @@ export default function App() {
                           <details style={{ marginTop: 8 }}>
                             <summary>Line items</summary>
                             <ul style={{ paddingLeft: 16, marginTop: 8, display: "grid", gap: 6 }}>
-                              {s.lines.map((ln) => {
+                              {s.lines.map((ln: QuoteLine) => {
                                 const item = cartItemByUpc.get(ln.upc);
                                 const title = item ? `${item.name}${item.brand ? ` (${item.brand})` : ""}` : ln.upc;
                                 const when = formatObservedAt(ln.observed_at ?? null);
@@ -526,7 +537,7 @@ export default function App() {
                     <label>
                       Store
                       <select value={submitStoreId} onChange={(e) => setSubmitStoreId(e.target.value)} style={{ marginLeft: 8 }}>
-                        {(stores?.stores ?? []).slice(0, 10).map((s) => (
+                        {(stores?.stores ?? []).slice(0, 10).map((s: Store) => (
                           <option key={s.id} value={s.id}>
                             {s.name} ({s.id})
                           </option>
