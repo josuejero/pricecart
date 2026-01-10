@@ -1,11 +1,13 @@
 
 {
   "compilerOptions": {
+    "tsBuildInfoFile": "./.tsbuildinfo",
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "declaration": true,
     "outDir": "dist",
+    "composite": true,
     "strict": true
   },
   "include": ["src"]
